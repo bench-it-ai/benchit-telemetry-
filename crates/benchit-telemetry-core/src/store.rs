@@ -307,11 +307,16 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         if new {
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-            restrict_file(&path);
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         init_schema(&conn)?;
+        // the history is private to the user, including databases created by older versions
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.clone().into_os_string();
+            p.push(suffix);
+            restrict_file(Path::new(&p));
+        }
         Ok(Self { conn, path })
     }
 
@@ -1060,6 +1065,24 @@ mod tests {
         assert_eq!(sm.energy_sources, vec!["gpu", "cpu_pkg"]);
         // a window with a single sample has no energy figure
         assert_eq!(s.summary(1_000_000, 1_000_005).unwrap().energy_est_wh, None);
+    }
+
+    #[test]
+    fn database_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("m.db");
+        // an older database that was created world-readable
+        drop(Store::open(&p).unwrap());
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut s = Store::open(&p).unwrap();
+        s.insert(&snap(1_000_000, 1.0)).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let f = format!("{}{suffix}", p.display());
+            if let Ok(m) = std::fs::metadata(&f) {
+                assert_eq!(m.permissions().mode() & 0o777, 0o600, "{f}");
+            }
+        }
     }
 
     #[test]
