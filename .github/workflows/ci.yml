@@ -28,8 +28,3 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all --locked
-  python-panel:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: python3 -m py_compile contrib/gtk-panel/benchit-panel.py

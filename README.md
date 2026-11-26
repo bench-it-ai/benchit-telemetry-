@@ -2,7 +2,7 @@
 
 Workstation telemetry for benchmarking on Linux GPU boxes: a logger daemon that keeps a
 rolling **30-day SQLite history**, an **HTTP JSON API**, a **CLI** for summaries, exports and
-benchmark windows, and **panel feeds** for desktop widgets (conky, the bundled GTK panel).
+benchmark windows, and **panel feeds** for desktop widgets (conky, the native desktop panel).
 
 > Status: **0.1.0-dev, pre-review.** APIs and the CLI may still change before 0.1.0.
 
@@ -145,15 +145,22 @@ WHERE m.name = 'llama-bench' GROUP BY g.idx;
 
 * **conky**: `contrib/conky/benchit.conkyrc` runs `benchit-telemetry panel --width 44`; text
   lines are ellipsised to the width, never clipped.
-* **GTK panel**: `contrib/gtk-panel/benchit-panel.py` (+ `contrib/systemd/benchit-panel.service`)
-  is a display-only widget that reads `latest.json` and seeds sparklines from `metrics.db`. Its
-  window sizes itself to its content and stays inside the monitor work area. Right-click toggles
-  compact mode, left-drag moves it, middle-click quits.
+* **Native panel** (`benchit-panel`, crate `benchit-telemetry-panel`, egui): an always-on-top,
+  display-only window fed by the daemon's `current.json` (read through `benchit-telemetry-core`),
+  with sparklines seeded from `metrics.db`. It sizes itself to its content, stays inside the
+  monitor work area, and shows every GPU, storage/network and the recording status. Right-click
+  toggles compact mode (remembered in `~/.config/benchit-panel.json`), left-drag moves it,
+  middle-click quits. `benchit-panel --snapshot out.png [--compact]` renders one frame to a PNG.
+  It runs on X11 (XWayland under GNOME, because Wayland clients cannot position windows) and
+  uses Mesa software GL so it never touches a benchmark GPU (`BENCHIT_PANEL_GPU=1` to opt out).
+  Needs only runtime libraries that desktops already have (libX11, libGL/libEGL, libxkbcommon);
+  fonts Inter and JetBrains Mono are used if installed. Unit: `contrib/systemd/benchit-panel.service`.
 
 ## Crates
 
 * `benchit-telemetry-core` — library: `Collector`, `Snapshot` model, `Store`, panel renderers.
 * `benchit-telemetry` — binary: daemon, API (`benchit_telemetry::api::router`), CLI.
+* `benchit-telemetry-panel` — binary `benchit-panel`: native desktop panel.
 
 ## Development
 

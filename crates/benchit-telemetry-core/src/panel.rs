@@ -4,13 +4,32 @@ use crate::model::Snapshot;
 use serde_json::{json, Value};
 
 /// Recording status included in the panel feed.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RecInfo {
     pub rows: i64,
     pub last_ts: i64,
     pub interval_s: f64,
     pub fast: bool,
     pub retain_days: u32,
+}
+
+/// What a desktop panel needs: the latest snapshot and the recorder status.
+#[derive(Debug, Clone)]
+pub struct Feed {
+    pub snapshot: Snapshot,
+    pub rec: Option<RecInfo>,
+}
+
+/// Read the daemon's feed from `dir` (`current.json` for the snapshot, the `rec` key of
+/// `latest.json` for recorder status). `None` if the daemon has not written one yet.
+pub fn read_feed(dir: &std::path::Path) -> Option<Feed> {
+    let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(dir.join(crate::paths::CURRENT_FILE)).ok()?).ok()?;
+    let rec = std::fs::read(dir.join(crate::paths::PANEL_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|mut v| v.get_mut("rec").map(Value::take))
+        .and_then(|r| serde_json::from_value(r).ok());
+    Some(Feed { snapshot, rec })
 }
 
 /// Flat JSON consumed by the bundled GTK panel (`contrib/gtk-panel`). Key names are kept
@@ -213,6 +232,22 @@ mod tests {
         let t = text(&sample(), 30);
         assert!(t.lines().all(|l| l.chars().count() <= 30), "{t}");
         assert!(t.contains("GPU0 RTX 5060 Ti"));
+    }
+
+    #[test]
+    fn feed_roundtrip() {
+        let d = std::env::temp_dir().join(format!("bt-feed-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(read_feed(&d).is_none());
+        let s = sample();
+        std::fs::write(d.join(crate::paths::CURRENT_FILE), serde_json::to_vec(&s).unwrap()).unwrap();
+        let rec = RecInfo { rows: 5, last_ts: 1, interval_s: 10.0, fast: false, retain_days: 30 };
+        std::fs::write(d.join(crate::paths::PANEL_FILE), serde_json::to_vec(&flat_json(&s, Some(&rec))).unwrap())
+            .unwrap();
+        let f = read_feed(&d).unwrap();
+        assert_eq!(f.snapshot, s);
+        assert_eq!(f.rec.unwrap().rows, 5);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

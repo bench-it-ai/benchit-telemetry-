@@ -8,4 +8,4 @@
 - `daemon`, `serve`, `current`, `panel`, `status`, `history`, `gpus`, `summary`, `export`,
   `mark`, `marks`, `run`, `fields` subcommands.
 - HTTP JSON API (axum).
-- contrib: systemd user units, conky config, GTK desktop panel.
+- contrib: systemd user units, conky config, native egui desktop panel (benchit-panel).

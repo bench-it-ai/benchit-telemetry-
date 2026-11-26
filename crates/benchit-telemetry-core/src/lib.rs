@@ -16,6 +16,7 @@ pub mod collect;
 pub mod model;
 pub mod panel;
 pub mod parse;
+pub mod paths;
 pub mod store;
 pub mod timefmt;
 
