@@ -10,9 +10,35 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: i64 = 1;
+/// Current schema version, stored in `PRAGMA user_version`.
+/// v1: initial. v2: `marks(name, id)` index and a four-GPU `samples_wide` view.
+pub const SCHEMA_VERSION: i64 = 2;
 
-const SCHEMA: &str = r#"
+/// A caller mistake (bad time expression, unknown field, ...): reported as HTTP 400.
+#[derive(Debug)]
+pub struct BadRequest(pub String);
+impl std::fmt::Display for BadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for BadRequest {}
+
+/// The database is missing or not readable yet: reported as HTTP 503.
+#[derive(Debug)]
+pub struct Unavailable(pub String);
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Unavailable {}
+
+fn bad(msg: impl Into<String>) -> anyhow::Error {
+    BadRequest(msg.into()).into()
+}
+
+const TABLES: &str = r#"
 CREATE TABLE IF NOT EXISTS samples(
   ts INTEGER NOT NULL, host TEXT NOT NULL,
   cpu_temp_c REAL, cpu_temp2_c REAL, cpu_temp3_c REAL, cpu_util_pct REAL, cpu_mhz REAL, load1 REAL,
@@ -38,17 +64,50 @@ CREATE TABLE IF NOT EXISTS marks(
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
 CREATE INDEX IF NOT EXISTS gpu_samples_ts ON gpu_samples(ts);
-DROP VIEW IF EXISTS samples_wide;
-CREATE VIEW samples_wide AS
-SELECT datetime(s.ts,'unixepoch','localtime') AS local_time, s.*,
-  g0.temp_c AS gpu0_temp_c, g0.power_w AS gpu0_power_w, g0.util_pct AS gpu0_util_pct,
-  g0.vram_used_mb AS gpu0_vram_used_mb, g0.sm_mhz AS gpu0_sm_mhz,
-  g1.temp_c AS gpu1_temp_c, g1.power_w AS gpu1_power_w, g1.util_pct AS gpu1_util_pct,
-  g1.vram_used_mb AS gpu1_vram_used_mb, g1.sm_mhz AS gpu1_sm_mhz
-FROM samples s
-LEFT JOIN gpu_samples g0 ON g0.host=s.host AND g0.ts=s.ts AND g0.idx=0
-LEFT JOIN gpu_samples g1 ON g1.host=s.host AND g1.ts=s.ts AND g1.idx=1;
+CREATE INDEX IF NOT EXISTS marks_name ON marks(name, id);
 "#;
+
+/// Number of GPUs exposed as `gpuN_*` columns in `samples_wide`.
+pub const WIDE_GPUS: usize = 4;
+
+fn wide_view_sql() -> String {
+    let mut cols = String::new();
+    let mut joins = String::new();
+    for i in 0..WIDE_GPUS {
+        cols.push_str(&format!(
+            ",\n  g{i}.temp_c AS gpu{i}_temp_c, g{i}.power_w AS gpu{i}_power_w, g{i}.util_pct AS gpu{i}_util_pct, \
+             g{i}.vram_used_mb AS gpu{i}_vram_used_mb, g{i}.sm_mhz AS gpu{i}_sm_mhz"
+        ));
+        joins.push_str(&format!("\nLEFT JOIN gpu_samples g{i} ON g{i}.host=s.host AND g{i}.ts=s.ts AND g{i}.idx={i}"));
+    }
+    format!(
+        "DROP VIEW IF EXISTS samples_wide;\nCREATE VIEW samples_wide AS\n\
+         SELECT datetime(s.ts,'unixepoch','localtime') AS local_time, s.*{cols}\nFROM samples s{joins};"
+    )
+}
+
+/// Create or migrate the schema. Runs only when `user_version` is not current.
+fn init_schema(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > SCHEMA_VERSION {
+        bail!(
+            "database schema v{version} was written by a newer benchit-telemetry (this build understands up to v{SCHEMA_VERSION}); \
+             refusing to touch it"
+        );
+    }
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    // 0 = fresh database, or a v1 database from before user_version was used; 1 = v1.
+    // CREATE ... IF NOT EXISTS makes the same script both "create" and "migrate v1 -> v2".
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(TABLES)?;
+    tx.execute_batch(&wide_view_sql())?;
+    tx.execute("INSERT OR REPLACE INTO meta VALUES('schema_version', ?1)", params![SCHEMA_VERSION.to_string()])?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
 
 /// Numeric `samples` columns that may be requested through history/summary queries.
 pub const SAMPLE_FIELDS: &[&str] = &[
@@ -117,6 +176,12 @@ pub const SUMMARY_FIELDS: &[&str] = &[
     "net_tx_mbs",
 ];
 
+/// A bare read-write SQLite connection (test helper; bypasses schema checks).
+#[doc(hidden)]
+pub fn raw_connection(path: &Path) -> Result<Connection> {
+    Ok(Connection::open(path)?)
+}
+
 pub struct Store {
     conn: Connection,
     path: PathBuf,
@@ -137,7 +202,15 @@ pub struct Summary {
     pub from: i64,
     pub to: i64,
     pub samples: usize,
-    pub energy_wh: Option<f64>,
+    /// Estimated energy in Wh: trapezoid integral of `est_total_w` (GPU board power + CPU package
+    /// power when readable). Gaps longer than 3 sample intervals are skipped, not interpolated.
+    pub energy_est_wh: Option<f64>,
+    /// Which sources fed `energy_est_wh`: `gpu` and/or `cpu_pkg`.
+    pub energy_sources: Vec<String>,
+    /// Seconds of the window actually covered by the energy integral.
+    pub coverage_s: i64,
+    /// Same integral over `platform_w` (whole-platform RAPL "psys"), where the machine has it.
+    pub platform_energy_est_wh: Option<f64>,
     pub metrics: Vec<Stats>,
     /// Per-GPU statistics keyed by index.
     pub gpus: Vec<(u32, Vec<Stats>)>,
@@ -171,11 +244,25 @@ pub fn validate_fields(requested: &str, allowed: &[&str]) -> Result<Vec<String>>
     let mut out = Vec::new();
     for f in requested.split(',').map(str::trim).filter(|f| !f.is_empty()) {
         if !allowed.contains(&f) {
-            bail!("unknown field {f:?}; allowed: {}", allowed.join(","));
+            return Err(bad(format!("unknown field {f:?}; allowed: {}", allowed.join(","))));
         }
         out.push(f.to_string());
     }
     Ok(out)
+}
+
+/// Trapezoid integral (Wh) of a `(ts, watts)` series, skipping spans longer than `max_gap` seconds.
+/// Returns `(energy, seconds covered)`; `None` when no span qualifies.
+fn integrate(series: &[(i64, f64)], max_gap: i64) -> (Option<f64>, i64) {
+    let (mut ws, mut cov) = (0.0, 0i64);
+    for w in series.windows(2) {
+        let dt = w[1].0 - w[0].0;
+        if dt > 0 && dt <= max_gap {
+            ws += dt as f64 * (w[0].1 + w[1].1) / 2.0;
+            cov += dt;
+        }
+    }
+    ((cov > 0).then_some(ws / 3600.0), cov)
 }
 
 fn stats(field: &str, mut v: Vec<f64>) -> Option<Stats> {
@@ -207,7 +294,9 @@ fn row_to_map(row: &rusqlite::Row, cols: &[String]) -> rusqlite::Result<Map<Stri
 }
 
 impl Store {
-    /// Open (creating if needed) the database at `path`.
+    /// Open (creating or migrating if needed) the database at `path`. Schema work happens only
+    /// when `user_version` differs from [`SCHEMA_VERSION`], so routine opens (marks, the API)
+    /// take no write lock for DDL.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(dir) = path.parent() {
@@ -218,23 +307,36 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         if new {
             conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+            restrict_file(&path);
         }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(SCHEMA)?;
-        conn.execute("INSERT OR REPLACE INTO meta VALUES('schema_version', ?1)", params![SCHEMA_VERSION.to_string()])?;
+        init_schema(&conn)?;
         Ok(Self { conn, path })
     }
 
     /// Open read-only (for API/CLI queries while the daemon writes).
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(Unavailable(format!("no database at {} (is the daemon running?)", path.display())).into());
+        }
         let conn = Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .with_context(|| format!("opening {} (is the daemon running?)", path.display()))?;
+        .map_err(|e| Unavailable(format!("opening {}: {e}", path.display())))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            bail!("database schema v{version} was written by a newer benchit-telemetry (this build understands up to v{SCHEMA_VERSION})");
+        }
+        if version < SCHEMA_VERSION {
+            return Err(Unavailable(
+                "database schema is older than this build; start the daemon (or any writing command) once to migrate it".into(),
+            )
+            .into());
+        }
         Ok(Self { conn, path })
     }
 
@@ -328,14 +430,20 @@ impl Store {
         Ok(())
     }
 
-    /// Delete everything older than `retain_days`; returns the number of sample rows removed.
+    /// Delete samples older than `retain_days`; returns the number of sample rows removed.
+    /// Benchmark marks are tiny and are the benchmark record, so they are kept (see [`Store::prune_marks`]).
     pub fn prune(&self, retain_days: u32, now: i64) -> Result<usize> {
         let cut = now - i64::from(retain_days) * 86400;
         let n = self.conn.execute("DELETE FROM samples WHERE ts < ?1", [cut])?;
         self.conn.execute("DELETE FROM gpu_samples WHERE ts < ?1", [cut])?;
-        self.conn.execute("DELETE FROM marks WHERE t_start < ?1", [cut as f64])?;
         self.conn.execute_batch("PRAGMA incremental_vacuum; PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(n)
+    }
+
+    /// Delete marks that started more than `days` ago (opt-in; `prune` never does this).
+    pub fn prune_marks(&self, days: u32, now: i64) -> Result<usize> {
+        let cut = (now - i64::from(days) * 86400) as f64;
+        Ok(self.conn.execute("DELETE FROM marks WHERE t_start < ?1", [cut])?)
     }
 
     pub fn count(&self) -> Result<i64> {
@@ -348,7 +456,7 @@ impl Store {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?;
         let gpu_samples = self.conn.query_row("SELECT count(*) FROM gpu_samples", [], |r| r.get(0))?;
-        let schema_version = self.meta("schema_version")?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        let schema_version = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         Ok(Status {
             path: self.path.display().to_string(),
             size_bytes: std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0),
@@ -360,28 +468,18 @@ impl Store {
         })
     }
 
-    /// Resolve a time expression: unix seconds, a relative duration (`-15m`, `2h` ago), `now`,
-    /// or a local timestamp such as `2026-01-31 08:00` / `2026-01-31T08:00:00`.
+    /// Resolve a time expression (see [`parse_time`] for the grammar); only timestamp strings
+    /// go through SQLite, for local-time conversion.
     pub fn resolve_time(&self, expr: &str, now: i64) -> Result<i64> {
-        let e = expr.trim();
-        if e.is_empty() || e == "now" {
-            return Ok(now);
-        }
-        if let Ok(v) = e.parse::<f64>() {
-            if v > 1e8 {
-                return Ok(v as i64);
+        match parse_time(expr, now)? {
+            Parsed::At(t) => Ok(t),
+            Parsed::DateTime(dt) => {
+                let v: Option<i64> =
+                    self.conn
+                        .query_row("SELECT CAST(strftime('%s', ?1, 'utc') AS INTEGER)", [dt.as_str()], |r| r.get(0))?;
+                v.ok_or_else(|| bad(format!("cannot parse time {expr:?}")))
             }
         }
-        let rel = e.strip_prefix('-').unwrap_or(e);
-        if let Some(d) = crate::timefmt::parse_duration(rel) {
-            if rel.chars().last().is_some_and(|c| c.is_ascii_alphabetic()) || e.starts_with('-') {
-                return Ok(now - d as i64);
-            }
-        }
-        let v: Option<i64> =
-            self.conn
-                .query_row("SELECT CAST(strftime('%s', ?1, 'utc') AS INTEGER)", [e.replace('T', " ")], |r| r.get(0))?;
-        v.with_context(|| format!("cannot parse time {expr:?} (use unix seconds, -15m, or 'YYYY-MM-DD HH:MM')"))
     }
 
     /// Format unix seconds as local `YYYY-MM-DD HH:MM:SS` (uses SQLite's localtime).
@@ -405,7 +503,7 @@ impl Store {
         let fields: Vec<String> = if fields.is_empty() { all } else { fields.to_vec() };
         for f in &fields {
             if !SAMPLE_FIELDS.contains(&f.as_str()) && !SAMPLE_TEXT_FIELDS.contains(&f.as_str()) {
-                bail!("unknown field {f:?}");
+                return Err(bad(format!("unknown field {f:?}")));
             }
         }
         let (sql, cols) = if step > 0 {
@@ -485,7 +583,8 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// min/avg/p95/max per metric plus an energy estimate (trapezoidal integral of `est_total_w`).
+    /// min/avg/p95/max per metric plus an energy estimate (trapezoidal integral of `est_total_w`,
+    /// skipping gaps longer than three sample intervals).
     pub fn summary(&self, from: i64, to: i64) -> Result<Summary> {
         let mut metrics = Vec::new();
         let mut samples = 0usize;
@@ -493,9 +592,16 @@ impl Store {
             "SELECT ts, {} FROM samples WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts",
             SUMMARY_FIELDS.join(", ")
         ))?;
+        let interval: f64 =
+            self.meta("sample_interval_s")?.and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(10.0);
+        let max_gap = (3.0 * interval) as i64;
+        let pos = |name: &str| SUMMARY_FIELDS.iter().position(|f| *f == name);
+        let (est_i, plat_i, gpu_i, pkg_i) =
+            (pos("est_total_w"), pos("platform_w"), pos("gpu_total_w"), pos("cpu_pkg_w"));
         let mut cols: Vec<Vec<f64>> = vec![Vec::new(); SUMMARY_FIELDS.len()];
-        let mut power: Vec<(i64, f64)> = Vec::new();
-        let est_idx = SUMMARY_FIELDS.iter().position(|f| *f == "est_total_w").unwrap_or(0);
+        // (ts, watts) series for the integrals
+        let mut est: Vec<(i64, f64)> = Vec::new();
+        let mut plat: Vec<(i64, f64)> = Vec::new();
         let mut rows = st.query(params![from, to])?;
         while let Some(r) = rows.next()? {
             samples += 1;
@@ -503,20 +609,32 @@ impl Store {
             for (i, col) in cols.iter_mut().enumerate() {
                 if let Some(v) = r.get::<_, Option<f64>>(i + 1)? {
                     col.push(v);
-                    if i == est_idx {
-                        power.push((ts, v));
+                    if Some(i) == est_i {
+                        est.push((ts, v));
+                    }
+                    if Some(i) == plat_i {
+                        plat.push((ts, v));
                     }
                 }
             }
+        }
+        let has = |i: Option<usize>| i.is_some_and(|i| !cols[i].is_empty());
+        let mut energy_sources = Vec::new();
+        if has(gpu_i) {
+            energy_sources.push("gpu".to_string());
+        }
+        if has(pkg_i) {
+            energy_sources.push("cpu_pkg".to_string());
         }
         for (i, col) in cols.into_iter().enumerate() {
             if let Some(s) = stats(SUMMARY_FIELDS[i], col) {
                 metrics.push(s);
             }
         }
-        let energy_wh = (power.len() > 1).then(|| {
-            power.windows(2).map(|w| (w[1].0 - w[0].0) as f64 * (w[0].1 + w[1].1) / 2.0).sum::<f64>() / 3600.0
-        });
+        let (energy, coverage_s) = integrate(&est, max_gap);
+        let (plat_energy, _) = integrate(&plat, max_gap);
+        let energy_est_wh = energy;
+        let platform_energy_est_wh = plat_energy;
         let mut gpus = Vec::new();
         let idxs: Vec<u32> = {
             let mut q =
@@ -541,7 +659,17 @@ impl Store {
             let st: Vec<Stats> = cols.into_iter().enumerate().filter_map(|(i, c)| stats(GPU_FIELDS[i], c)).collect();
             gpus.push((idx, st));
         }
-        Ok(Summary { from, to, samples, energy_wh, metrics, gpus })
+        Ok(Summary {
+            from,
+            to,
+            samples,
+            energy_est_wh,
+            energy_sources,
+            coverage_s,
+            platform_energy_est_wh,
+            metrics,
+            gpus,
+        })
     }
 
     pub fn mark_start(&self, host: &str, name: &str, t: f64, cmd: Option<&str>) -> Result<i64> {
@@ -552,30 +680,48 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Close the newest open mark with `name`; returns its id if one was open.
-    pub fn mark_end(&self, name: &str, t: f64, exit_code: Option<i32>) -> Result<Option<i64>> {
+    /// Close the newest open mark named `name` (on `host` when given); returns its id if one was open.
+    pub fn mark_end(&self, host: Option<&str>, name: &str, t: f64, exit_code: Option<i32>) -> Result<Option<i64>> {
         let id: Option<i64> = self
             .conn
-            .query_row("SELECT max(id) FROM marks WHERE name=?1 AND t_end IS NULL", [name], |r| r.get(0))
+            .query_row(
+                "SELECT max(id) FROM marks WHERE name=?1 AND t_end IS NULL AND (?2 IS NULL OR host=?2)",
+                params![name, host],
+                |r| r.get(0),
+            )
             .optional()?
             .flatten();
         if let Some(id) = id {
-            self.mark_end_id(id, t, exit_code)?;
+            self.mark_end_id(id, t, exit_code, None)?;
         }
         Ok(id)
     }
 
-    pub fn mark_end_id(&self, id: i64, t: f64, exit_code: Option<i32>) -> Result<()> {
-        self.conn.execute("UPDATE marks SET t_end=?1, exit_code=?2 WHERE id=?3", params![t, exit_code, id])?;
-        Ok(())
+    /// Close mark `id`. Returns `false` (and changes nothing) if it does not exist or is already
+    /// closed; use [`Store::mark_exists`] to tell the two apart.
+    pub fn mark_end_id(&self, id: i64, t: f64, exit_code: Option<i32>, note: Option<&str>) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE marks SET t_end=?1, exit_code=?2, note=?4 WHERE id=?3 AND t_end IS NULL",
+            params![t, exit_code, id, note],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn mark_exists(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT count(*) FROM marks WHERE id=?1", [id], |r| r.get::<_, i64>(0))? > 0)
     }
 
     pub fn marks(&self, limit: usize) -> Result<Vec<Mark>> {
-        let mut st = self.conn.prepare(
-            "SELECT id, host, name, t_start, t_end, cmd, exit_code, note FROM marks ORDER BY id DESC LIMIT ?1",
-        )?;
+        self.marks_where("1=1", params![], limit)
+    }
+
+    fn marks_where(&self, cond: &str, args: &[&dyn rusqlite::ToSql], limit: usize) -> Result<Vec<Mark>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT id, host, name, t_start, t_end, cmd, exit_code, note FROM marks WHERE {cond} ORDER BY id DESC LIMIT {}",
+            limit as i64
+        ))?;
         let v = st
-            .query_map([limit as i64], |r| {
+            .query_map(args, |r| {
                 Ok(Mark {
                     id: r.get(0)?,
                     host: r.get(1)?,
@@ -591,8 +737,13 @@ impl Store {
         Ok(v)
     }
 
+    /// Newest mark with this name (any host).
     pub fn mark_by_name(&self, name: &str) -> Result<Option<Mark>> {
-        Ok(self.marks(10_000)?.into_iter().find(|m| m.name == name))
+        Ok(self.marks_where("name=?1", params![name], 1)?.into_iter().next())
+    }
+
+    pub fn mark_by_id(&self, id: i64) -> Result<Option<Mark>> {
+        Ok(self.marks_where("id=?1", params![id], 1)?.into_iter().next())
     }
 
     /// Write `samples_wide` rows between `from` and `to` as CSV.
@@ -620,11 +771,131 @@ impl Store {
     }
 }
 
+/// Quote a text cell for CSV, and neutralise spreadsheet formula injection (`=`, `+`, `-`, `@`,
+/// tab or CR at the start of text such as `top_proc` or a mark's command line).
 fn csv_escape(s: &str) -> String {
-    if s.contains([',', '"', '\n']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+    let mut cell = s.to_string();
+    if cell.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        cell.insert(0, '\'');
+    }
+    if cell.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", cell.replace('"', "\"\""))
     } else {
-        s.to_string()
+        cell
+    }
+}
+
+/// Make a freshly created data file private (0600).
+fn restrict_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// Result of [`parse_time`].
+#[derive(Debug, PartialEq)]
+pub enum Parsed {
+    /// Resolved to unix seconds.
+    At(i64),
+    /// A validated `YYYY-MM-DD[ T]HH:MM[:SS][Z|±HH:MM]` string that SQLite should convert to UTC
+    /// (local time unless it carries an explicit zone).
+    DateTime(String),
+}
+
+const MAX_SPAN_S: f64 = 3.2e9; // ~100 years: anything larger is a typo, not a window
+
+/// Parse a time expression.
+///
+/// * `now`, or empty: the current time.
+/// * `-15m`, `-90s`, `-2h`, `-7d`, `-1w`, `-90`: that long ago. A unit without the minus (`2h`)
+///   also means "2 h ago".
+/// * a bare number of at least 1e8: unix seconds. Smaller bare numbers are rejected as ambiguous
+///   (use `-90s`); so are non-finite or absurd values.
+/// * `YYYY-MM-DD HH:MM[:SS]` (or with `T`), local time; a trailing `Z` or `±HH:MM` makes it absolute.
+pub fn parse_time(expr: &str, now: i64) -> Result<Parsed> {
+    let e = expr.trim();
+    if e.is_empty() || e == "now" {
+        return Ok(Parsed::At(now));
+    }
+    let has_unit = e.chars().last().is_some_and(|c| c.is_ascii_alphabetic());
+    let rel = e.strip_prefix('-');
+    if rel.is_some() || has_unit {
+        let body = rel.unwrap_or(e);
+        if let Some(d) = crate::timefmt::parse_duration(body) {
+            if d.is_finite() && d <= MAX_SPAN_S {
+                return Ok(Parsed::At(now - d as i64));
+            }
+            return Err(bad(format!("duration {expr:?} is out of range")));
+        }
+    }
+    if let Ok(v) = e.parse::<f64>() {
+        if !v.is_finite() {
+            return Err(bad(format!("{expr:?} is not a finite time")));
+        }
+        if (1e8..1e11).contains(&v) {
+            return Ok(Parsed::At(v as i64));
+        }
+        return Err(bad(format!(
+            "bare number {expr:?} is ambiguous: unix seconds must be >= 1e8; use -{e}s for \"{e} seconds ago\""
+        )));
+    }
+    if looks_like_datetime(e) {
+        return Ok(Parsed::DateTime(e.replace('T', " ")));
+    }
+    Err(bad(format!("cannot parse time {expr:?} (use unix seconds, -15m, now, or 'YYYY-MM-DD HH:MM[:SS][Z|+HH:MM]')")))
+}
+
+fn looks_like_datetime(e: &str) -> bool {
+    let b = e.as_bytes();
+    let d = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+    if !(d(0)
+        && d(1)
+        && d(2)
+        && d(3)
+        && b.get(4) == Some(&b'-')
+        && d(5)
+        && d(6)
+        && b.get(7) == Some(&b'-')
+        && d(8)
+        && d(9))
+    {
+        return false;
+    }
+    if b.len() == 10 {
+        return true; // date only: midnight
+    }
+    if !matches!(b.get(10), Some(b' ') | Some(b'T')) || !(d(11) && d(12) && b.get(13) == Some(&b':') && d(14) && d(15))
+    {
+        return false;
+    }
+    let mut i = 16;
+    if b.get(i) == Some(&b':') {
+        if !(d(17) && d(18)) {
+            return false;
+        }
+        i = 19;
+        if b.get(i) == Some(&b'.') {
+            i += 1;
+            let start = i;
+            while d(i) {
+                i += 1;
+            }
+            if i == start {
+                return false;
+            }
+        }
+    }
+    match &e[i..] {
+        "" | "Z" | "z" => true,
+        z => {
+            let zb = z.as_bytes();
+            zb.len() == 6
+                && matches!(zb[0], b'+' | b'-')
+                && zb[1].is_ascii_digit()
+                && zb[2].is_ascii_digit()
+                && zb[3] == b':'
+                && zb[4].is_ascii_digit()
+                && zb[5].is_ascii_digit()
+        }
     }
 }
 
@@ -675,7 +946,9 @@ mod tests {
         let u = sm.metrics.iter().find(|m| m.field == "cpu_util_pct").unwrap();
         assert_eq!((u.min, u.max, u.avg), (0.0, 90.0, 45.0));
         // est_total_w = 2*w, w from 0..90 over 90 s => avg 90 W * 90 s = 2.25 Wh
-        assert!((sm.energy_wh.unwrap() - 2.25).abs() < 1e-9);
+        assert!((sm.energy_est_wh.unwrap() - 2.25).abs() < 1e-9);
+        assert_eq!(sm.coverage_s, 90);
+        assert_eq!(sm.energy_sources, vec!["gpu", "cpu_pkg"]);
         assert_eq!(sm.gpus.len(), 1);
         let removed = s.prune(30, 1_000_050 + 30 * 86400).unwrap();
         assert_eq!(removed, 5);
@@ -692,18 +965,176 @@ mod tests {
     }
 
     #[test]
-    fn marks_and_time() {
+    fn marks_lifecycle() {
         let d = tempfile::tempdir().unwrap();
         let s = Store::open(d.path().join("m.db")).unwrap();
         let id = s.mark_start("test", "bench", 100.0, Some("echo hi")).unwrap();
-        assert_eq!(s.mark_end("bench", 200.0, Some(0)).unwrap(), Some(id));
+        assert_eq!(s.mark_end(Some("other-host"), "bench", 150.0, Some(0)).unwrap(), None, "wrong host");
+        assert_eq!(s.mark_end(Some("test"), "bench", 200.0, Some(0)).unwrap(), Some(id));
         let m = s.mark_by_name("bench").unwrap().unwrap();
         assert_eq!(m.t_end, Some(200.0));
-        assert_eq!(s.resolve_time("-15m", 10_000).unwrap(), 10_000 - 900);
-        assert_eq!(s.resolve_time("2h", 10_000).unwrap(), 10_000 - 7200);
-        assert_eq!(s.resolve_time("1790000000", 0).unwrap(), 1_790_000_000);
+        // a closed mark is never overwritten
+        assert!(!s.mark_end_id(id, 999.0, Some(1), None).unwrap());
+        assert!(s.mark_exists(id).unwrap());
+        assert!(!s.mark_exists(id + 100).unwrap());
+        assert_eq!(s.mark_by_name("bench").unwrap().unwrap().t_end, Some(200.0));
+        let id2 = s.mark_start("test", "bench", 300.0, None).unwrap();
+        assert!(s.mark_end_id(id2, 310.0, Some(130), Some("signal 2")).unwrap());
+        assert_eq!(s.mark_by_id(id2).unwrap().unwrap().note.as_deref(), Some("signal 2"));
+        // marks outlive the sample retention window
+        s.prune(30, 100 + 365 * 86400).unwrap();
+        assert_eq!(s.marks(10).unwrap().len(), 2);
+        assert_eq!(s.prune_marks(30, 100 + 365 * 86400).unwrap(), 2);
+    }
+
+    fn at(e: &str, now: i64) -> i64 {
+        match parse_time(e, now).unwrap_or_else(|err| panic!("{e}: {err}")) {
+            Parsed::At(t) => t,
+            Parsed::DateTime(_) => panic!("{e} is a datetime"),
+        }
+    }
+
+    #[test]
+    fn time_expressions() {
+        assert_eq!(at("-15m", 10_000), 10_000 - 900);
+        assert_eq!(at("2h", 10_000), 10_000 - 7200, "a unit without '-' means ago");
+        assert_eq!(at("-90", 10_000), 10_000 - 90);
+        assert_eq!(at("-90s", 10_000), 10_000 - 90);
+        assert_eq!(at("now", 77), 77);
+        assert_eq!(at("", 77), 77);
+        assert_eq!(at("1790000000", 0), 1_790_000_000);
+    }
+
+    #[test]
+    fn bare_small_numbers_are_not_julian_days() {
+        // regression: "90" used to fall through to SQLite's strftime and mean Julian day 90
+        for bad in ["90", "3600", "99999999", "0"] {
+            let e = parse_time(bad, 1_000_000_000).unwrap_err();
+            assert!(e.downcast_ref::<BadRequest>().is_some(), "{bad}: {e}");
+            assert!(e.to_string().contains("ambiguous"), "{e}");
+        }
+    }
+
+    #[test]
+    fn non_finite_and_absurd_times_are_rejected() {
+        for bad in
+            ["inf", "-inf", "nan", "1e30", "-1e30s", "1e30s", "1e12", "9999999999999", "-", "--5m", "5x", "2026-13"]
+        {
+            assert!(parse_time(bad, 1_000_000_000).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn datetime_strings_with_zones() {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(d.path().join("m.db")).unwrap();
+        // explicit zones are absolute and independent of the machine's timezone
+        assert_eq!(s.resolve_time("2026-03-08T10:00:00Z", 0).unwrap(), 1_772_964_000);
+        assert_eq!(s.resolve_time("2026-03-08 03:00:00-07:00", 0).unwrap(), 1_772_964_000);
+        assert_eq!(s.resolve_time("2026-03-08T12:00+02:00", 0).unwrap(), 1_772_964_000);
+        assert_eq!(s.resolve_time("2026-03-08 10:00:00.250Z", 0).unwrap(), 1_772_964_000);
+        // local times resolve to *something* sane (the DST-gap hour shifts forward, per SQLite)
+        assert!(s.resolve_time("2026-03-08 02:30", 0).unwrap() > 1_700_000_000);
         assert!(s.resolve_time("2026-01-31 08:00", 0).unwrap() > 1_700_000_000);
+        assert!(s.resolve_time("2026-01-31", 0).unwrap() > 1_700_000_000);
         assert!(s.resolve_time("not a time", 0).is_err());
+        assert!(s.resolve_time("2026-01-31 25:00 junk", 0).is_err());
+    }
+
+    #[test]
+    fn energy_skips_gaps_and_reports_coverage() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path().join("m.db")).unwrap();
+        s.set_meta("sample_interval_s", "10").unwrap();
+        // 10 W for 30 s, an 8-hour gap, then 10 W for 30 s
+        for i in 0..4 {
+            s.insert(&snap(1_000_000 + i * 10, 5.0)).unwrap(); // est_total_w = 10 W
+        }
+        for i in 0..4 {
+            s.insert(&snap(1_000_000 + 8 * 3600 + i * 10, 5.0)).unwrap();
+        }
+        let sm = s.summary(0, 2_000_000).unwrap();
+        assert_eq!(sm.coverage_s, 60, "the gap must not be interpolated");
+        let wh = sm.energy_est_wh.unwrap();
+        assert!((wh - 10.0 * 60.0 / 3600.0).abs() < 1e-9, "{wh}");
+        assert_eq!(sm.energy_sources, vec!["gpu", "cpu_pkg"]);
+        // a window with a single sample has no energy figure
+        assert_eq!(s.summary(1_000_000, 1_000_005).unwrap().energy_est_wh, None);
+    }
+
+    #[test]
+    fn fresh_database_is_current_and_reopen_is_cheap() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("m.db");
+        drop(Store::open(&p).unwrap());
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.status().unwrap().schema_version, SCHEMA_VERSION);
+        // the read-only open works against a current database
+        assert!(Store::open_readonly(&p).is_ok());
+    }
+
+    #[test]
+    fn migrates_v1_database_in_place() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("old.db");
+        {
+            // what the first release created: v1 tables, meta.schema_version=1, user_version 0
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(TABLES).unwrap();
+            c.execute_batch("DROP INDEX marks_name;").unwrap();
+            c.execute("INSERT INTO meta VALUES('schema_version','1')", []).unwrap();
+            c.execute("INSERT INTO samples(ts,host,cpu_util_pct) VALUES(1000,'h',42.0)", []).unwrap();
+        }
+        assert!(Store::open_readonly(&p).is_err(), "read-only open must not pretend an old schema is current");
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.status().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(s.meta("schema_version").unwrap().as_deref(), Some("2"));
+        assert_eq!(s.count().unwrap(), 1, "data survives the migration");
+        let idx: i64 =
+            s.conn.query_row("SELECT count(*) FROM sqlite_master WHERE name='marks_name'", [], |r| r.get(0)).unwrap();
+        assert_eq!(idx, 1);
+        assert!(Store::open_readonly(&p).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_newer_database() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("new.db");
+        drop(Store::open(&p).unwrap());
+        Connection::open(&p).unwrap().pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
+        let e = Store::open(&p).err().unwrap();
+        assert!(e.to_string().contains("newer benchit-telemetry"), "{e}");
+        assert!(Store::open_readonly(&p).is_err());
+        // and it was left untouched
+        let v: i64 = Connection::open(&p).unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn wide_view_covers_four_gpus() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path().join("m.db")).unwrap();
+        let mut sn = snap(1_000_000, 5.0);
+        sn.gpus = (0..4)
+            .map(|i| Gpu { idx: i, name: format!("G{i}"), power_w: Some(10.0 * (i + 1) as f64), ..Default::default() })
+            .collect();
+        s.insert(&sn).unwrap();
+        let mut buf = Vec::new();
+        s.export_csv(0, 2_000_000, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let header = text.lines().next().unwrap();
+        assert!(header.contains("gpu3_power_w"), "{header}");
+        assert!(text.lines().nth(1).unwrap().contains(",40,"), "gpu3 power present");
+    }
+
+    #[test]
+    fn csv_cells_are_not_formulas() {
+        assert_eq!(csv_escape("=HYPERLINK(\"x\")"), "\"'=HYPERLINK(\"\"x\"\")\"");
+        assert_eq!(csv_escape("+1"), "'+1");
+        assert_eq!(csv_escape("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(csv_escape("a\rb"), "\"a\rb\"");
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
     }
 
     #[test]

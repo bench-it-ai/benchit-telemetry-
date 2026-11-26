@@ -97,6 +97,14 @@ pub fn wrapping_delta(prev: u64, cur: u64, range: u64) -> u64 {
 /// Columns requested from `nvidia-smi`; `name` is last so commas in names cannot shift fields.
 pub const NVSMI_FIELDS: &str = "index,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used,memory.total,clocks.sm,clocks.mem,fan.speed,pstate,clocks_event_reasons.active,name";
 
+/// Query variants tried in order: the R535+ name, the older alias, and no throttle column at
+/// all (very old drivers reject the whole query when one field is unknown).
+pub const NVSMI_FIELD_LADDER: [(&str, bool); 3] = [
+    (NVSMI_FIELDS, true),
+    ("index,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used,memory.total,clocks.sm,clocks.mem,fan.speed,pstate,clocks_throttle_reasons.active,name", true),
+    ("index,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used,memory.total,clocks.sm,clocks.mem,fan.speed,pstate,name", false),
+];
+
 fn num(s: &str) -> Option<f64> {
     let s = s.trim();
     if s.is_empty() || s.starts_with('[') || s.eq_ignore_ascii_case("n/a") {
@@ -112,10 +120,16 @@ fn text(s: &str) -> Option<String> {
 
 /// Parse `nvidia-smi --query-gpu=<NVSMI_FIELDS> --format=csv,noheader,nounits` output.
 pub fn nvidia_smi_csv(out: &str) -> Vec<Gpu> {
+    nvidia_smi_csv_with(out, true)
+}
+
+/// Like [`nvidia_smi_csv`]; `reasons` says whether the throttle-reasons column is present.
+pub fn nvidia_smi_csv_with(out: &str, reasons: bool) -> Vec<Gpu> {
+    let ncols = if reasons { 13 } else { 12 };
     out.lines()
         .filter_map(|l| {
-            let f: Vec<&str> = l.splitn(13, ',').collect();
-            if f.len() < 13 {
+            let f: Vec<&str> = l.splitn(ncols, ',').collect();
+            if f.len() < ncols {
                 return None;
             }
             Some(Gpu {
@@ -130,11 +144,24 @@ pub fn nvidia_smi_csv(out: &str) -> Vec<Gpu> {
                 mem_mhz: num(f[8]),
                 fan_pct: num(f[9]),
                 pstate: text(f[10]),
-                clk_event_reasons: text(f[11]),
-                name: f[12].trim().to_string(),
+                clk_event_reasons: if reasons { text(f[11]) } else { None },
+                name: f[ncols - 1].trim().to_string(),
             })
         })
         .collect()
+}
+
+/// Delta of a counter that wraps at `range`; `None` when it went backwards and the range is
+/// unknown (a reset or an unreadable `max_energy_range_uj`), so the caller skips the sample
+/// instead of reporting a wrong value.
+pub fn wrapping_delta_checked(prev: u64, cur: u64, range: u64) -> Option<u64> {
+    if cur >= prev {
+        Some(cur - prev)
+    } else if range > prev {
+        Some(range - prev + cur)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +213,14 @@ mod tests {
     }
 
     #[test]
+    fn wrap_checked() {
+        assert_eq!(wrapping_delta_checked(10, 25, 0), Some(15));
+        assert_eq!(wrapping_delta_checked(90, 10, 100), Some(20));
+        assert_eq!(wrapping_delta_checked(90, 10, 0), None);
+        assert_eq!(wrapping_delta_checked(90, 10, 50), None);
+    }
+
+    #[test]
     fn nvidia_csv() {
         let out = "0, 45, 120.50, 180.00, 97, 15000, 16311, 2800, 13801, 55, P2, 0x0000000000000000, NVIDIA GeForce RTX 5060 Ti\n\
                    1, 50, 6.36, [N/A], 0, 768, 8151, 180, 405, [N/A], P8, 0x0000000000000400, NVIDIA GeForce RTX 5070 Laptop GPU\n";
@@ -197,5 +232,21 @@ mod tests {
         assert_eq!(g[1].fan_pct, None);
         assert_eq!(g[1].pstate.as_deref(), Some("P8"));
         assert!(nvidia_smi_csv("NVIDIA-SMI has failed").is_empty());
+    }
+
+    #[test]
+    fn nvidia_csv_edge_cases() {
+        // error strings in numeric columns, commas in the name, a missing throttle column
+        let out = "0, [Unknown Error], [Not Supported], [N/A], 5, 1, 2, 3, 4, [N/A], P0, 0x0, NVIDIA RTX, Super\n\
+                   GPU has fallen off the bus.\n\n";
+        let g = nvidia_smi_csv(out);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].temp_c, None);
+        assert_eq!(g[0].power_w, None);
+        assert_eq!(g[0].name, "NVIDIA RTX, Super");
+        let g = nvidia_smi_csv_with("2, 40, 10, 100, 1, 1, 2, 3, 4, 20, P5, Some, Name", false);
+        assert_eq!(g[0].idx, 2);
+        assert_eq!(g[0].clk_event_reasons, None);
+        assert_eq!(g[0].name, "Some, Name");
     }
 }

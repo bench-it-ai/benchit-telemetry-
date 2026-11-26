@@ -13,6 +13,7 @@
 #![recursion_limit = "256"]
 
 pub mod collect;
+pub mod gpu;
 pub mod model;
 pub mod panel;
 pub mod parse;

@@ -1,11 +1,11 @@
 //! Hardware collection from `/proc`, `/sys` and `nvidia-smi`.
+use crate::gpu::{GpuConfig, GpuPoller};
 use crate::model::*;
 use crate::parse::{self, DiskCounters};
 use crate::timefmt::now_f64;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Collector settings.
@@ -15,12 +15,14 @@ pub struct CollectorConfig {
     pub root: PathBuf,
     /// Second filesystem to report as `home` when it is a different device from `/`.
     pub home: Option<PathBuf>,
-    /// Query NVIDIA GPUs with `nvidia-smi` (skipped automatically if it is missing).
+    /// Query NVIDIA GPUs (NVML, falling back to `nvidia-smi`; skipped automatically if neither exists).
     pub nvidia: bool,
-    /// Timeout for one `nvidia-smi` call.
-    pub nvidia_timeout: Duration,
+    /// GPU backend settings (timeout, poll period). `gpu.root` is overridden by `root`.
+    pub gpu: GpuConfig,
     /// Scan `/proc/<pid>` for the largest resident process.
     pub top_process: bool,
+    /// How often the (relatively expensive) top-process scan runs.
+    pub top_process_period: Duration,
     /// CPU temperature that raises `WARN_CPU_TEMP`.
     pub cpu_temp_warn_c: f64,
     /// GPU temperature that raises `WARN_GPU_TEMP`.
@@ -33,8 +35,9 @@ impl Default for CollectorConfig {
             root: PathBuf::from("/"),
             home: std::env::var_os("HOME").map(PathBuf::from),
             nvidia: true,
-            nvidia_timeout: Duration::from_secs(5),
+            gpu: GpuConfig::default(),
             top_process: true,
+            top_process_period: Duration::from_secs(10),
             cpu_temp_warn_c: 95.0,
             gpu_temp_warn_c: 88.0,
         }
@@ -77,8 +80,21 @@ pub struct Collector {
     temps: TempSources,
     pkg: Option<Energy>,
     psys: Option<Energy>,
-    nvidia_ok: bool,
+    gpu: Option<GpuPoller>,
+    gpu_first: bool,
     prev: Option<Prev>,
+    /// Counters at the last storage-interval boundary (see [`Collector::interval_snapshot`]).
+    interval_base: Option<Prev>,
+    top_proc: Option<(Instant, Option<String>)>,
+    discovered: Instant,
+}
+
+/// Short host name (`/proc/sys/kernel/hostname` up to the first dot) without building a full [`Collector`].
+pub fn hostname(root: &Path) -> String {
+    read_trim(root.join("proc/sys/kernel/hostname"))
+        .map(|h| h.split('.').next().unwrap_or("").to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".into())
 }
 
 fn read(p: impl AsRef<Path>) -> Option<String> {
@@ -100,10 +116,7 @@ fn round(v: f64, nd: i32) -> f64 {
 
 impl Collector {
     pub fn new(cfg: CollectorConfig) -> Self {
-        let host = read_trim(cfg.root.join("proc/sys/kernel/hostname"))
-            .map(|h| h.split('.').next().unwrap_or("").to_string())
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| "localhost".into());
+        let host = hostname(&cfg.root);
         let cpuinfo = read(cfg.root.join("proc/cpuinfo")).unwrap_or_default();
         let cpu_model = cpuinfo
             .lines()
@@ -113,8 +126,26 @@ impl Collector {
         let threads = cpuinfo.lines().filter(|l| l.starts_with("processor")).count();
         let temps = discover_temps(&cfg.root.join("sys/class/hwmon"));
         let (pkg, psys) = discover_rapl(&cfg.root.join("sys/class/powercap"));
-        let nvidia_ok = cfg.nvidia;
-        Self { cfg, host, cpu_model, threads, temps, pkg, psys, nvidia_ok, prev: None }
+        let gpu = cfg.nvidia.then(|| {
+            let mut g = cfg.gpu.clone();
+            g.root = cfg.root.clone();
+            GpuPoller::spawn(g)
+        });
+        Self {
+            cfg,
+            host,
+            cpu_model,
+            threads,
+            temps,
+            pkg,
+            psys,
+            gpu,
+            gpu_first: true,
+            prev: None,
+            interval_base: None,
+            top_proc: None,
+            discovered: Instant::now(),
+        }
     }
 
     pub fn host(&self) -> &str {
@@ -130,18 +161,19 @@ impl Collector {
         let t = now_f64();
         let mut s = Snapshot { ts: t as i64, host: self.host.clone(), ..Default::default() };
         let prev = self.prev.take();
-        let dt = prev.as_ref().map(|p| (t - p.t).max(1e-3));
         let mut cur = Prev { t, ..Default::default() };
+        if self.discovered.elapsed() > Duration::from_secs(600) {
+            // sensor drivers (k10temp, nvidia, ...) can appear after boot
+            self.temps = discover_temps(&self.cfg.root.join("sys/class/hwmon"));
+            let (pkg, psys) = discover_rapl(&self.cfg.root.join("sys/class/powercap"));
+            (self.pkg, self.psys) = (pkg, psys);
+            self.discovered = Instant::now();
+        }
 
         // CPU
         s.cpu.model = self.cpu_model.clone();
         s.cpu.threads = self.threads;
         cur.cpu = read(self.p("proc/stat")).as_deref().and_then(parse::proc_stat_cpu);
-        if let (Some((b1, t1)), Some(Some((b0, t0)))) = (cur.cpu, prev.as_ref().map(|p| p.cpu)) {
-            if t1 > t0 {
-                s.cpu.util_pct = Some(round(100.0 * (b1.saturating_sub(b0)) as f64 / (t1 - t0) as f64, 1));
-            }
-        }
         s.cpu.mhz = self.cpu_mhz();
         if let Some((a, b, c)) = read(self.p("proc/loadavg")).as_deref().and_then(parse::loadavg) {
             (s.cpu.load1, s.cpu.load5, s.cpu.load15) = (Some(a), Some(b), Some(c));
@@ -152,19 +184,11 @@ impl Collector {
         s.cpu.temp3_c = temp(&self.temps.t3);
         if s.cpu.temp2_c.is_none() {
             if let Some(dir) = &self.temps.hottest_dir {
-                s.cpu.temp2_c = hottest(dir).filter(|v| Some(*v) != s.cpu.temp_c);
+                s.cpu.temp2_c = hottest(dir);
             }
         }
         cur.pkg_uj = self.pkg.as_ref().and_then(|e| read_u64(&e.path));
         cur.psys_uj = self.psys.as_ref().and_then(|e| read_u64(&e.path));
-        if let (Some(dt), Some(p)) = (dt, prev.as_ref()) {
-            let watts = |e: &Option<Energy>, c: Option<u64>, o: Option<u64>| match (e, c, o) {
-                (Some(e), Some(c), Some(o)) => Some(round(parse::wrapping_delta(o, c, e.range) as f64 / 1e6 / dt, 1)),
-                _ => None,
-            };
-            s.cpu.pkg_w = watts(&self.pkg, cur.pkg_uj, p.pkg_uj);
-            s.cpu.platform_w = watts(&self.psys, cur.psys_uj, p.psys_uj);
-        }
 
         // Memory
         let mi = parse::meminfo(&read(self.p("proc/meminfo")).unwrap_or_default());
@@ -181,34 +205,12 @@ impl Collector {
             s.mem.swap_used_mb = Some((t - f).max(0.0));
         }
         cur.vm = parse::vmstat(&read(self.p("proc/vmstat")).unwrap_or_default());
-        if let (Some(dt), Some(p)) = (dt, prev.as_ref()) {
-            let rate = |k: &str| match (cur.vm.get(k), p.vm.get(k)) {
-                (Some(c), Some(o)) => Some(round(c.saturating_sub(*o) as f64 / dt, 0)),
-                _ => None,
-            };
-            s.mem.majflt_s = rate("pgmajfault");
-            s.mem.swpin_s = rate("pswpin");
-            s.mem.swpout_s = rate("pswpout");
-        }
 
         // Disk + filesystems
         let block = self.p("sys/block");
         cur.disk = parse::diskstats(&read(self.p("proc/diskstats")).unwrap_or_default(), |n| {
             block.join(n).join("device").exists()
         });
-        if let (Some(dt), Some(p)) = (dt, prev.as_ref()) {
-            let (mut r, mut w, mut busy) = (0u64, 0u64, 0u64);
-            for (n, c) in &cur.disk {
-                if let Some(o) = p.disk.get(n) {
-                    r += c.read_bytes.saturating_sub(o.read_bytes);
-                    w += c.write_bytes.saturating_sub(o.write_bytes);
-                    busy = busy.max(c.io_ticks_ms.saturating_sub(o.io_ticks_ms));
-                }
-            }
-            s.disk.read_mbs = Some(round(r as f64 / dt / 1e6, 2));
-            s.disk.write_mbs = Some(round(w as f64 / dt / 1e6, 2));
-            s.disk.busy_pct = Some(round((busy as f64 / (dt * 10.0)).min(100.0), 1));
-        }
         s.disk.filesystems = self.filesystems();
 
         // Network
@@ -216,43 +218,104 @@ impl Collector {
         cur.net = parse::net_dev(&read(self.p("proc/net/dev")).unwrap_or_default(), |n| {
             netdir.join(n).join("device").exists()
         });
-        if let (Some(dt), Some(p)) = (dt, prev.as_ref()) {
-            let (mut rx, mut tx) = (0u64, 0u64);
-            for (n, (r, t)) in &cur.net {
-                if let Some((or, ot)) = p.net.get(n) {
-                    rx += r.saturating_sub(*or);
-                    tx += t.saturating_sub(*ot);
-                }
-            }
-            s.net.rx_mbs = Some(round(rx as f64 / dt / 1e6, 3));
-            s.net.tx_mbs = Some(round(tx as f64 / dt / 1e6, 3));
+        if let Some(p) = prev.as_ref() {
+            self.fill_rates(&mut s, p, &cur);
         }
 
         // GPUs, fans, battery, processes
-        if self.nvidia_ok {
-            match nvidia_smi(self.cfg.nvidia_timeout) {
-                Ok(g) => s.gpus = g,
-                Err(NvError::Missing) => self.nvidia_ok = false,
-                Err(NvError::Failed) => {}
-            }
+        if let Some(g) = &self.gpu {
+            // the first call waits for the poller's first result; later calls never block
+            let wait = if self.gpu_first { self.cfg.gpu.timeout + Duration::from_secs(1) } else { Duration::ZERO };
+            self.gpu_first = false;
+            s.gpus = g.latest(wait);
         }
-        if !s.gpus.is_empty() {
-            let gw: f64 = s.gpus.iter().filter_map(|g| g.power_w).sum();
-            s.gpu_total_w = Some(round(gw, 1));
-        }
-        s.est_total_w = match (s.gpu_total_w, s.cpu.pkg_w) {
-            (None, None) => None,
-            (g, c) => Some(round(g.unwrap_or(0.0) + c.unwrap_or(0.0), 1)),
-        };
+        recompute_totals(&mut s);
         s.fans = fans(&self.p("sys/class/hwmon"));
         s.battery = battery(&self.p("sys/class/power_supply"));
         if self.cfg.top_process {
-            s.top_proc = top_process(&self.p("proc"));
+            let stale = self.top_proc.as_ref().is_none_or(|(t, _)| t.elapsed() >= self.cfg.top_process_period);
+            if stale {
+                self.top_proc = Some((Instant::now(), top_process(&self.p("proc"))));
+            }
+            s.top_proc = self.top_proc.as_ref().and_then(|(_, v)| v.clone());
         }
         s.uptime_s = read(self.p("proc/uptime")).and_then(|u| u.split_whitespace().next().and_then(|x| x.parse().ok()));
         s.flags = self.flags(&s);
         self.prev = Some(cur);
         s
+    }
+
+    /// Fill every counter-derived field of `s` from two counter sets.
+    fn fill_rates(&self, s: &mut Snapshot, p: &Prev, cur: &Prev) {
+        let dt = (cur.t - p.t).max(1e-3);
+        if let (Some((b1, t1)), Some((b0, t0))) = (cur.cpu, p.cpu) {
+            if t1 > t0 {
+                s.cpu.util_pct = Some(round(100.0 * (b1.saturating_sub(b0)) as f64 / (t1 - t0) as f64, 1));
+            }
+        }
+        let watts = |e: &Option<Energy>, c: Option<u64>, o: Option<u64>| match (e, c, o) {
+            (Some(e), Some(c), Some(o)) => {
+                parse::wrapping_delta_checked(o, c, e.range).map(|d| round(d as f64 / 1e6 / dt, 1))
+            }
+            _ => None,
+        };
+        s.cpu.pkg_w = watts(&self.pkg, cur.pkg_uj, p.pkg_uj);
+        s.cpu.platform_w = watts(&self.psys, cur.psys_uj, p.psys_uj);
+        let rate = |k: &str| match (cur.vm.get(k), p.vm.get(k)) {
+            (Some(c), Some(o)) => Some(round(c.saturating_sub(*o) as f64 / dt, 0)),
+            _ => None,
+        };
+        s.mem.majflt_s = rate("pgmajfault");
+        s.mem.swpin_s = rate("pswpin");
+        s.mem.swpout_s = rate("pswpout");
+        let (mut r, mut w, mut busy) = (0u64, 0u64, 0u64);
+        for (n, c) in &cur.disk {
+            if let Some(o) = p.disk.get(n) {
+                r += c.read_bytes.saturating_sub(o.read_bytes);
+                w += c.write_bytes.saturating_sub(o.write_bytes);
+                // io_ticks is a 32-bit kernel counter: it wraps after ~49.7 days
+                busy = busy.max(parse::wrapping_delta(o.io_ticks_ms, c.io_ticks_ms, 1 << 32));
+            }
+        }
+        s.disk.read_mbs = Some(round(r as f64 / dt / 1e6, 2));
+        s.disk.write_mbs = Some(round(w as f64 / dt / 1e6, 2));
+        s.disk.busy_pct = Some(round((busy as f64 / (dt * 10.0)).min(100.0), 1));
+        let (mut rx, mut tx) = (0u64, 0u64);
+        for (n, (r, t)) in &cur.net {
+            if let Some((or, ot)) = p.net.get(n) {
+                rx += r.saturating_sub(*or);
+                tx += t.saturating_sub(*ot);
+            }
+        }
+        s.net.rx_mbs = Some(round(rx as f64 / dt / 1e6, 3));
+        s.net.tx_mbs = Some(round(tx as f64 / dt / 1e6, 3));
+    }
+
+    /// The snapshot to **store** for a storage interval. Every counter-derived field (CPU %,
+    /// package/platform watts, fault rates, disk and network throughput) is re-computed as the
+    /// average over the whole span since the previous call, rather than over the last tick only.
+    /// Call it right after [`Collector::sample`] each time a row is stored. If the span is
+    /// longer than `max_span` seconds (suspend, stalled loop) those fields are left empty
+    /// instead of averaging across the gap. The first call has no baseline and returns `snap`.
+    pub fn interval_snapshot(&mut self, snap: &Snapshot, max_span: f64) -> Snapshot {
+        let mut out = snap.clone();
+        let cur = self.prev.clone();
+        if let (Some(base), Some(c)) = (self.interval_base.take(), cur.as_ref()) {
+            out.cpu.util_pct = None;
+            out.cpu.pkg_w = None;
+            out.cpu.platform_w = None;
+            out.mem.majflt_s = None;
+            out.mem.swpin_s = None;
+            out.mem.swpout_s = None;
+            (out.disk.read_mbs, out.disk.write_mbs, out.disk.busy_pct) = (None, None, None);
+            (out.net.rx_mbs, out.net.tx_mbs) = (None, None);
+            if c.t > base.t && c.t - base.t <= max_span {
+                self.fill_rates(&mut out, &base, c);
+            }
+            recompute_totals(&mut out);
+        }
+        self.interval_base = cur;
+        out
     }
 
     /// Take two samples `gap` apart and return the second (so rates are populated).
@@ -295,13 +358,13 @@ impl Collector {
     fn filesystems(&self) -> Vec<Filesystem> {
         let mut out = Vec::new();
         let root_dev = statfs(&self.cfg.root).map(|(d, ..)| d);
-        if let Some((_, used, total)) = statfs(&self.cfg.root) {
-            out.push(fs_entry("root", "/", used, total));
+        if let Some((_, used, total, avail)) = statfs(&self.cfg.root) {
+            out.push(fs_entry("root", "/", used, total, avail));
         }
         if let Some(home) = &self.cfg.home {
-            if let Some((dev, used, total)) = statfs(home) {
+            if let Some((dev, used, total, avail)) = statfs(home) {
                 if Some(dev) != root_dev {
-                    out.push(fs_entry("home", &home.to_string_lossy(), used, total));
+                    out.push(fs_entry("home", &home.to_string_lossy(), used, total, avail));
                 }
             }
         }
@@ -317,29 +380,29 @@ impl Collector {
             f.push("WARN_GPU_TEMP".into());
         }
         if s.mem.used_pct.is_some_and(|u| u >= 90.0) {
-            f.push("WARN_MEMAVAIL<10%".into());
+            f.push("WARN_MEM_LOW".into());
         }
         if let Some(b) = &s.battery {
             if b.ac_online == Some(false) && b.pct.is_some_and(|p| p <= 15.0) {
-                f.push("WARN_BATTERY<=15%".into());
+                f.push("WARN_BATTERY_LOW".into());
             }
         }
         f
     }
 }
 
-fn fs_entry(role: &str, path: &str, used: u64, total: u64) -> Filesystem {
+fn fs_entry(role: &str, path: &str, used: u64, total: u64, avail: u64) -> Filesystem {
     Filesystem {
         role: role.into(),
         path: path.into(),
         used_gb: round(used as f64 / 1e9, 1),
         total_gb: round(total as f64 / 1e9, 1),
-        used_pct: if total > 0 { round(100.0 * used as f64 / total as f64, 1) } else { 0.0 },
+        used_pct: if used + avail > 0 { round(100.0 * used as f64 / (used + avail) as f64, 1) } else { 0.0 },
     }
 }
 
-/// `(device id, used bytes, total bytes)` for the filesystem holding `path`.
-fn statfs(path: &Path) -> Option<(u64, u64, u64)> {
+/// `(device id, used bytes, total bytes, bytes available to non-root)` for the filesystem holding `path`.
+fn statfs(path: &Path) -> Option<(u64, u64, u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     let dev = fs::metadata(path).ok()?.dev();
@@ -352,7 +415,9 @@ fn statfs(path: &Path) -> Option<(u64, u64, u64)> {
     let frsize = st.f_frsize as u64;
     let total = st.f_blocks as u64 * frsize;
     let free = st.f_bfree as u64 * frsize;
-    Some((dev, total.saturating_sub(free), total))
+    let avail = st.f_bavail as u64 * frsize;
+    // like `df`: percentage of what a normal user can use (excludes root-reserved blocks)
+    Some((dev, total.saturating_sub(free), total, avail))
 }
 
 fn hwmons(dir: &Path) -> Vec<(String, PathBuf)> {
@@ -405,7 +470,7 @@ fn discover_temps(hwmon: &Path) -> TempSources {
             hottest_dir: Some(d.clone()),
         };
     }
-    for vendor in ["alienware_wmi", "zenpower", "cpu_thermal", "acpitz"] {
+    for vendor in ["alienware_wmi", "zenpower", "cpu_thermal", "thinkpad", "asus", "dell_smm", "acpitz"] {
         if let Some((_, d)) = mons.iter().find(|(n, _)| n == vendor) {
             let l = labelled(d, "temp");
             let cpu = l.iter().find(|(lab, _)| lab.eq_ignore_ascii_case("cpu")).map(|(_, p)| p.clone());
@@ -416,7 +481,12 @@ fn discover_temps(hwmon: &Path) -> TempSources {
 }
 
 fn hottest(dir: &Path) -> Option<f64> {
-    labelled(dir, "temp").iter().filter_map(|(_, p)| read_u64(p)).max().map(|v| round(v as f64 / 1000.0, 1))
+    labelled(dir, "temp")
+        .iter()
+        .filter(|(label, _)| !label.starts_with("Package"))
+        .filter_map(|(_, p)| read_u64(p))
+        .max()
+        .map(|v| round(v as f64 / 1000.0, 1))
 }
 
 fn discover_rapl(powercap: &Path) -> (Option<Energy>, Option<Energy>) {
@@ -467,12 +537,14 @@ fn fans(hwmon: &Path) -> Vec<Fan> {
 }
 
 fn battery(ps: &Path) -> Option<Battery> {
-    let mut bat = None;
-    let mut ac = None;
-    for e in fs::read_dir(ps).ok()?.flatten() {
-        let p = e.path();
+    let mut entries: Vec<PathBuf> = fs::read_dir(ps).ok()?.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    let mut bats = Vec::new();
+    let mut ac_seen = false;
+    let mut ac_online = false;
+    for p in entries {
         match read_trim(p.join("type")).as_deref() {
-            Some("Battery") if bat.is_none() && read_trim(p.join("scope")).as_deref() != Some("Device") => {
+            Some("Battery") if read_trim(p.join("scope")).as_deref() != Some("Device") => {
                 let pct = read_u64(p.join("capacity")).map(|v| v as f64);
                 let status = read_trim(p.join("status"));
                 let mut w = read_u64(p.join("power_now")).map(|v| v as f64 / 1e6).or_else(|| {
@@ -483,19 +555,47 @@ fn battery(ps: &Path) -> Option<Battery> {
                 if status.as_deref() == Some("Discharging") {
                     w = w.map(|x| -x.abs());
                 }
-                bat = Some(Battery { pct, watts: w.map(|x| round(x, 2)), status, ac_online: None });
+                // energy_full/energy_now (µWh) weight the percentage when there are several packs
+                let full =
+                    read_u64(p.join("energy_full")).or_else(|| read_u64(p.join("charge_full"))).map(|v| v as f64);
+                bats.push((pct, w, status, full));
             }
-            Some("Mains") => ac = read_u64(p.join("online")).map(|v| v == 1),
+            // USB-C power delivery supplies count as external power too
+            Some("Mains") | Some("USB") => {
+                if let Some(v) = read_u64(p.join("online")) {
+                    ac_seen = true;
+                    ac_online |= v == 1;
+                }
+            }
             _ => {}
         }
     }
-    bat.map(|mut b| {
-        b.ac_online = ac;
-        b
-    })
+    if bats.is_empty() {
+        return None;
+    }
+    let weight_total: f64 = bats.iter().filter_map(|b| b.3).sum();
+    let pct = if bats.len() == 1 || weight_total <= 0.0 {
+        bats[0].0
+    } else {
+        let sum: f64 = bats.iter().filter_map(|b| Some(b.0? * b.3?)).sum();
+        Some(round(sum / weight_total, 0))
+    };
+    let watts = bats.iter().filter_map(|b| b.1).fold(None, |a: Option<f64>, x| Some(a.unwrap_or(0.0) + x));
+    let status = bats.iter().find(|b| b.2.as_deref() == Some("Discharging")).or(bats.first()).and_then(|b| b.2.clone());
+    Some(Battery { pct, watts: watts.map(|x| round(x, 2)), status, ac_online: ac_seen.then_some(ac_online) })
+}
+
+/// GPU board power + CPU package power (both estimates; see `energy_sources` in summaries).
+pub fn recompute_totals(s: &mut Snapshot) {
+    s.gpu_total_w = (!s.gpus.is_empty()).then(|| round(s.gpus.iter().filter_map(|g| g.power_w).sum::<f64>(), 1));
+    s.est_total_w = match (s.gpu_total_w, s.cpu.pkg_w) {
+        (None, None) => None,
+        (g, c) => Some(round(g.unwrap_or(0.0) + c.unwrap_or(0.0), 1)),
+    };
 }
 
 fn top_process(proc_dir: &Path) -> Option<String> {
+    // SAFETY: sysconf has no preconditions; it only reads a system constant.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
     let mut best: Option<(u64, String)> = None;
     for e in fs::read_dir(proc_dir).ok()?.flatten() {
@@ -513,37 +613,6 @@ fn top_process(proc_dir: &Path) -> Option<String> {
         }
     }
     best.map(|(rss, comm)| format!("{}:{}", rss / (1024 * 1024), comm))
-}
-
-enum NvError {
-    Missing,
-    Failed,
-}
-
-fn nvidia_smi(timeout: Duration) -> Result<Vec<Gpu>, NvError> {
-    let mut child = Command::new("nvidia-smi")
-        .arg(format!("--query-gpu={}", parse::NVSMI_FIELDS))
-        .arg("--format=csv,noheader,nounits")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { NvError::Missing } else { NvError::Failed })?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(NvError::Failed);
-            }
-        }
-    }
-    let mut out = String::new();
-    use std::io::Read;
-    child.stdout.take().ok_or(NvError::Failed)?.read_to_string(&mut out).map_err(|_| NvError::Failed)?;
-    Ok(parse::nvidia_smi_csv(&out))
 }
 
 #[cfg(test)]
@@ -612,5 +681,144 @@ mod tests {
         assert_eq!(b.ac_online, Some(false));
         assert!(s.gpus.is_empty());
         assert_eq!(s.est_total_w, None);
+    }
+
+    fn basic(r: &Path) {
+        w(r, "proc/sys/kernel/hostname", "box\n");
+        w(r, "proc/cpuinfo", "processor\t: 0\nmodel name\t: X\n");
+        w(r, "proc/stat", "cpu  100 0 100 800 0 0 0 0 0 0\n");
+        w(r, "proc/loadavg", "1 1 1 1/1 1\n");
+        w(r, "proc/meminfo", "MemTotal: 1000 kB\nMemAvailable: 500 kB\n");
+        w(r, "proc/vmstat", "pgmajfault 0\n");
+        w(r, "proc/diskstats", " 8 0 sda 1 0 100 0 1 0 100 0 0 10 0\n");
+        w(r, "sys/block/sda/device/x", "");
+        w(r, "proc/net/dev", "h\nh\n eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n");
+        w(r, "sys/class/net/eth0/device/x", "");
+    }
+
+    fn quiet(r: &Path) -> Collector {
+        Collector::new(CollectorConfig {
+            root: r.to_path_buf(),
+            home: None,
+            nvidia: false,
+            top_process: false,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn stored_values_average_the_whole_interval_not_the_last_tick() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        basic(r);
+        let mut c = quiet(r);
+        let s0 = c.sample();
+        let _ = c.interval_snapshot(&s0, 1e6); // baseline
+                                               // tick 1: 1 MB received, CPU busy
+        std::thread::sleep(Duration::from_millis(30));
+        w(r, "proc/net/dev", "h\nh\n eth0: 1001000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n");
+        w(r, "proc/stat", "cpu  200 0 100 900 0 0 0 0 0 0\n");
+        let t1 = c.sample();
+        assert!(t1.net.rx_mbs.unwrap() > 0.0);
+        // tick 2: idle again. The tick values say "nothing happened", the interval value must not.
+        std::thread::sleep(Duration::from_millis(30));
+        w(r, "proc/stat", "cpu  200 0 100 1000 0 0 0 0 0 0\n");
+        let t2 = c.sample();
+        assert_eq!(t2.net.rx_mbs, Some(0.0));
+        assert_eq!(t2.cpu.util_pct, Some(0.0));
+        let stored = c.interval_snapshot(&t2, 1e6);
+        assert!(stored.net.rx_mbs.unwrap() > 0.0, "traffic from the first tick is part of the interval");
+        let util = stored.cpu.util_pct.unwrap();
+        assert!((util - 100.0 / 3.0).abs() < 0.1, "100 busy of 300 total jiffies = 33.3 %, got {util}");
+        // the next interval starts fresh
+        std::thread::sleep(Duration::from_millis(10));
+        let t3 = c.sample();
+        let stored3 = c.interval_snapshot(&t3, 1e6);
+        assert_eq!(stored3.net.rx_mbs, Some(0.0));
+    }
+
+    #[test]
+    fn interval_snapshot_does_not_average_across_a_gap() {
+        let d = tempfile::tempdir().unwrap();
+        basic(d.path());
+        let mut c = quiet(d.path());
+        let s0 = c.sample();
+        let _ = c.interval_snapshot(&s0, 0.01);
+        std::thread::sleep(Duration::from_millis(60));
+        let s1 = c.sample();
+        let stored = c.interval_snapshot(&s1, 0.01); // span 60 ms > max_span 10 ms
+        assert_eq!((stored.cpu.util_pct, stored.net.rx_mbs, stored.disk.read_mbs), (None, None, None));
+    }
+
+    #[test]
+    fn rapl_wrap_without_range_skips_the_sample() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        basic(r);
+        w(r, "sys/class/powercap/intel-rapl:0/name", "package-0\n");
+        w(r, "sys/class/powercap/intel-rapl:0/energy_uj", "5000000\n");
+        let mut c = quiet(r);
+        let _ = c.sample();
+        std::thread::sleep(Duration::from_millis(20));
+        w(r, "sys/class/powercap/intel-rapl:0/energy_uj", "100\n"); // went backwards, range unknown
+        assert_eq!(c.sample().cpu.pkg_w, None);
+        // with a known range the wrap is accounted for
+        w(r, "sys/class/powercap/intel-rapl:0/max_energy_range_uj", "10000000\n");
+        let mut c = quiet(r);
+        w(r, "sys/class/powercap/intel-rapl:0/energy_uj", "9000000\n");
+        let _ = c.sample();
+        std::thread::sleep(Duration::from_millis(20));
+        w(r, "sys/class/powercap/intel-rapl:0/energy_uj", "1000000\n");
+        assert!(c.sample().cpu.pkg_w.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn disk_busy_counter_wraps_at_32_bits() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        basic(r);
+        w(r, "proc/diskstats", " 8 0 sda 1 0 100 0 1 0 100 0 0 4294967290 0\n");
+        let mut c = quiet(r);
+        let _ = c.sample();
+        std::thread::sleep(Duration::from_millis(20));
+        w(r, "proc/diskstats", " 8 0 sda 1 0 100 0 1 0 100 0 0 10 0\n"); // wrapped: +16 ms busy
+        let busy = c.sample().disk.busy_pct.unwrap();
+        assert!(busy > 0.0 && busy <= 100.0, "{busy}");
+    }
+
+    #[test]
+    fn batteries_are_summed_and_ac_includes_usb_c() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        basic(r);
+        for (n, cap, full, pw) in [("BAT0", "50", "30000000", "5000000"), ("BAT1", "100", "10000000", "1000000")] {
+            w(r, &format!("sys/class/power_supply/{n}/type"), "Battery\n");
+            w(r, &format!("sys/class/power_supply/{n}/capacity"), &format!("{cap}\n"));
+            w(r, &format!("sys/class/power_supply/{n}/energy_full"), &format!("{full}\n"));
+            w(r, &format!("sys/class/power_supply/{n}/status"), "Discharging\n");
+            w(r, &format!("sys/class/power_supply/{n}/power_now"), &format!("{pw}\n"));
+        }
+        w(r, "sys/class/power_supply/AC/type", "Mains\n");
+        w(r, "sys/class/power_supply/AC/online", "0\n");
+        w(r, "sys/class/power_supply/ucsi-source-psy-1/type", "USB\n");
+        w(r, "sys/class/power_supply/ucsi-source-psy-1/online", "1\n");
+        let b = quiet(r).sample().battery.unwrap();
+        assert_eq!(b.pct, Some(63.0), "(50*30 + 100*10) / 40 = 62.5 weighted by capacity");
+        assert_eq!(b.watts, Some(-6.0));
+        assert_eq!(b.ac_online, Some(true));
+    }
+
+    #[test]
+    fn intel_temp2_is_not_suppressed_when_equal_to_package() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        basic(r);
+        w(r, "sys/class/hwmon/hwmon0/name", "coretemp\n");
+        w(r, "sys/class/hwmon/hwmon0/temp1_label", "Package id 0\n");
+        w(r, "sys/class/hwmon/hwmon0/temp1_input", "60000\n");
+        w(r, "sys/class/hwmon/hwmon0/temp2_label", "Core 0\n");
+        w(r, "sys/class/hwmon/hwmon0/temp2_input", "60000\n");
+        let s = quiet(r).sample();
+        assert_eq!((s.cpu.temp_c, s.cpu.temp2_c), (Some(60.0), Some(60.0)));
     }
 }

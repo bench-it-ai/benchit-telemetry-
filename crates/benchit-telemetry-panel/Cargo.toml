@@ -4,10 +4,9 @@ description = "Desktop telemetry panel for benchit-telemetry (egui, X11/XWayland
 readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
@@ -17,7 +16,7 @@ name = "benchit-panel"
 path = "src/main.rs"
 
 [dependencies]
-benchit-telemetry-core = { path = "../benchit-telemetry-core", version = "0.1.0" }
+benchit-telemetry-core = { path = "../benchit-telemetry-core", version = "0.1.0-dev" }
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
