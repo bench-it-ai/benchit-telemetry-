@@ -1,12 +1,20 @@
 # cargo-deny policy: advisories, licences and sources. Run `cargo deny check`.
 [advisories]
 yanked = "deny"
+# zbus 5 helper crates, folded into zbus 6 (no vulnerability). They come in via ksni (taskbar
+# indicator), which is still on zbus 5; drop these once ksni moves to zbus 6.
+ignore = [
+  { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; pulled in by ksni" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; pulled in by ksni" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; pulled in by ksni" },
+]
 
 [licenses]
 allow = [
   "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC",
   "Unicode-3.0", "Zlib", "MPL-2.0", "CC0-1.0", "BSL-1.0", "OFL-1.1", "LicenseRef-UFL-1.0",
   "Ubuntu-font-1.0", "NCSA", "0BSD",
+  "Unlicense", # ksni (taskbar indicator)
 ]
 confidence-threshold = 0.8
 

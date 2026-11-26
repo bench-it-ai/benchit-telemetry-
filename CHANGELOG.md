@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Panel taskbar indicator (StatusNotifierItem via `ksni`): label shows live CPU and GPU
+  temperatures (`CPU 62° GPU 55°/48°`), left-click shows/hides the panel, and its menu mirrors
+  the panel menu. GNOME needs the AppIndicator extension (see README). `--no-tray` disables it.
+- Fix: a hidden panel could not be shown again. eframe stops calling `App::ui` for a hidden
+  window, and the `--show` signal was only handled there; signals, taskbar commands, exports and
+  the feed now run in `App::logic`, which keeps ticking while hidden. Hide now always leaves the
+  indicator to restore it, and hidden is never persisted. New `benchit-panel --hide`.
+- cargo-deny: allow the Unlicense (ksni) and ignore the zbus 5 "merged into zbus 6"
+  unmaintained notices (RUSTSEC-2026-0370/0371/0372).
 - Panel right-click menu: Compact (as before), Hide panel (`benchit-panel --show` restores it),
   Copy stats to the clipboard, Export CSV / JSON and PDF report over 1h/24h/7d/30d, Quit.
   Exports hold the live snapshot plus the stored history, are written in the background to

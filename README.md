@@ -236,9 +236,10 @@ WHERE m.name = 'llama-bench' GROUP BY g.idx;
   monitor work area, and shows every GPU, storage/network and the recording status. Left-drag
   moves it, middle-click quits, and right-click opens a menu:
   * **Compact** toggles compact mode (remembered in `~/.config/benchit-panel.json`);
-  * **Hide panel** hides the window (the process keeps running); `benchit-panel --show` brings
-    it back (it signals the pid in `$XDG_RUNTIME_DIR/benchit-panel.pid`), as does restarting
-    `benchit-panel.service`;
+  * **Hide panel** hides the window to the taskbar indicator (below); clicking the indicator or
+    its **Show panel** item brings it back, as do `benchit-panel --show` (it signals the pid in
+    `$XDG_RUNTIME_DIR/benchit-panel.pid`; `--hide` is the reverse) and restarting
+    `benchit-panel.service`. Hidden is never remembered: the panel always starts visible;
   * **Copy stats** puts the `benchit-telemetry panel` text view plus a timestamp on the clipboard;
   * **Export CSV / Export JSON / PDF report** for the last 1h, 24h, 7d or 30d, written in the
     background to `~/benchit-reports/` (`$BENCHIT_REPORTS_DIR` overrides) as
@@ -252,6 +253,19 @@ WHERE m.name = 'llama-bench' GROUP BY g.idx;
     snapshot, the summary tables per metric and GPU, and charts of power, temperature,
     utilisation and memory;
   * **Quit panel** closes the panel (the logger keeps running).
+
+  **Taskbar indicator.** The panel also registers a StatusNotifierItem (the KDE/AppIndicator
+  tray protocol, via the pure-Rust `ksni` crate over D-Bus) whose label is the live temperature,
+  e.g. `CPU 62° GPU 55°/48°` (one value per GPU, `telemetry stale` when the feed is over 60 s
+  old), with a per-GPU tooltip. Left-click shows/hides the panel; its menu mirrors the panel
+  menu (Show/Hide panel, Compact, Copy stats, the exports, Quit). It runs as long as the panel
+  service does (`--no-tray` turns it off). Stock GNOME Shell has no tray: enable the
+  "AppIndicator and KStatusNotifierItem Support" extension
+  (`appindicatorsupport@rgcjonas.gmail.com`; EPEL package `gnome-shell-extension-appindicator`
+  or extensions.gnome.org), then log out and back in once. KDE Plasma and most other desktops
+  show it without anything extra. Check registration with
+  `busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher
+  org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems`.
 
   The same files can be written without a window: `benchit-panel --export csv|json|pdf
   [--range 24h] [--out-dir DIR]` prints the path. `benchit-panel --snapshot out.png [--compact]

@@ -2,9 +2,11 @@
 //!
 //! Display only: it reads the feed written by `benchit-telemetry daemon` (via
 //! `benchit-telemetry-core`) and seeds its sparklines from the history database.
-//! Left-drag moves, middle-click quits, right-click opens a menu: Compact (remembered), Hide
-//! (`benchit-panel --show` brings it back), Copy stats, Export CSV / JSON and PDF report over
-//! 1h/24h/7d/30d (saved under `~/benchit-reports/`, see [`report`]) and Quit.
+//! Left-drag moves, middle-click quits, right-click opens a menu: Compact (remembered), Hide,
+//! Copy stats, Export CSV / JSON and PDF report over 1h/24h/7d/30d (saved under
+//! `~/benchit-reports/`, see [`report`]) and Quit. A taskbar indicator ([`tray`]) shows the CPU
+//! and GPU temperatures, brings a hidden panel back on click, and carries the same menu;
+//! `benchit-panel --show` / `--hide` do the same from a shell. Hidden is never remembered.
 //! `benchit-panel --export csv|json|pdf [--range 24h]` writes the same files without a window.
 //! It runs on X11 (XWayland under GNOME) because Wayland clients cannot position windows, and
 //! renders with Mesa software GL so it never touches a benchmark GPU (`BENCHIT_PANEL_GPU=1`
@@ -15,6 +17,7 @@ mod menu;
 mod model;
 mod pdf;
 mod report;
+mod tray;
 
 use anyhow::Result;
 use benchit_telemetry_core::panel::{read_feed, Feed};
@@ -59,8 +62,14 @@ struct Args {
     #[arg(long)]
     out_dir: Option<PathBuf>,
     /// Show a running panel that was hidden from its menu, then exit.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "hide")]
     show: bool,
+    /// Hide a running panel (the taskbar indicator or --show brings it back), then exit.
+    #[arg(long)]
+    hide: bool,
+    /// Do not register the taskbar indicator.
+    #[arg(long)]
+    no_tray: bool,
 }
 
 fn parse_format(s: &str) -> Result<report::Format, String> {
@@ -73,9 +82,15 @@ fn parse_range(s: &str) -> Result<benchit_telemetry_core::ExportRange, String> {
 
 /// Set by SIGUSR1 (`benchit-panel --show`): un-hide the window.
 static SHOW: AtomicBool = AtomicBool::new(false);
+/// Set by SIGUSR2 (`benchit-panel --hide`): hide the window.
+static HIDE: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn on_sigusr1(_: libc::c_int) {
-    SHOW.store(true, Ordering::SeqCst);
+extern "C" fn on_signal(sig: libc::c_int) {
+    match sig {
+        libc::SIGUSR1 => SHOW.store(true, Ordering::SeqCst),
+        libc::SIGUSR2 => HIDE.store(true, Ordering::SeqCst),
+        _ => {}
+    }
 }
 
 /// `$XDG_RUNTIME_DIR/benchit-panel.pid` (or `/tmp/benchit-panel-<uid>.pid`).
@@ -87,8 +102,9 @@ fn pid_file() -> PathBuf {
     }
 }
 
-/// `--show`: signal the panel named in the pid file (only if that pid really is benchit-panel).
-fn signal_show() -> Result<()> {
+/// `--show` / `--hide`: signal the panel named in the pid file (only if that pid really is
+/// benchit-panel).
+fn signal_panel(sig: libc::c_int) -> Result<()> {
     let p = pid_file();
     let pid: i32 = std::fs::read_to_string(&p)
         .map_err(|e| anyhow::anyhow!("no running panel ({}: {e})", p.display()))?
@@ -100,7 +116,7 @@ fn signal_show() -> Result<()> {
         anyhow::bail!("no running panel (pid {pid} from {} is not benchit-panel)", p.display());
     }
     // SAFETY: plain kill(2) with a validated pid.
-    if unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
+    if unsafe { libc::kill(pid, sig) } != 0 {
         anyhow::bail!("signal pid {pid}: {}", std::io::Error::last_os_error());
     }
     Ok(())
@@ -220,6 +236,11 @@ struct Panel {
     reports_dir: PathBuf,
     /// Temperature unit for copied stats and reports (`panel.toml`).
     unit: benchit_telemetry_core::TempUnit,
+    /// Taskbar indicator, and the commands it sends us.
+    tray: Option<ksni::blocking::Handle<tray::Indicator>>,
+    tray_rx: Option<mpsc::Receiver<tray::Cmd>>,
+    /// Last view pushed to the indicator.
+    tray_view: tray::View,
 }
 
 impl Panel {
@@ -295,11 +316,7 @@ impl Panel {
                 self.cfg.compact = self.compact;
                 self.save_cfg();
             }
-            menu::Action::Hide => {
-                self.hidden = true;
-                eprintln!("benchit-panel: hidden; `benchit-panel --show` brings it back");
-                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            }
+            menu::Action::Hide => self.set_hidden(ctx, true),
             menu::Action::CopyStats => match self.feed.as_ref() {
                 Some(f) => {
                     ctx.copy_text(report::stats_text(&f.snapshot, self.unit));
@@ -338,12 +355,91 @@ impl Panel {
         }
     }
 
-    /// Un-hide after SIGUSR1 (`benchit-panel --show`).
-    fn apply_show(&mut self, ctx: &egui::Context) {
-        if SHOW.swap(false, Ordering::SeqCst) && self.hidden {
-            self.hidden = false;
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+    fn set_hidden(&mut self, ctx: &egui::Context, hidden: bool) {
+        if hidden == self.hidden {
+            return;
+        }
+        self.hidden = hidden;
+        if hidden {
+            self.menu = None;
+            let how = if self.tray.is_some() { "click the taskbar indicator or run" } else { "run" };
+            eprintln!("benchit-panel: hidden; {how} `benchit-panel --show` to bring it back");
+        } else {
+            eprintln!("benchit-panel: shown");
             self.hints_at = None;
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Visible(!hidden));
+    }
+
+    /// Per-frame work that must also happen while the window is hidden (eframe then calls only
+    /// `App::logic`, never `App::ui`): taskbar and signal commands, exports, the feed, and the
+    /// indicator label.
+    fn tick(&mut self, ctx: &egui::Context) {
+        let cmds: Vec<tray::Cmd> = self.tray_rx.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for c in cmds {
+            match c {
+                tray::Cmd::ToggleWindow => self.set_hidden(ctx, !self.hidden),
+                tray::Cmd::Do(a) => self.act(ctx, a),
+            }
+        }
+        if SHOW.swap(false, Ordering::SeqCst) {
+            self.set_hidden(ctx, false);
+        }
+        if HIDE.swap(false, Ordering::SeqCst) {
+            self.set_hidden(ctx, true);
+        }
+        self.poll_job();
+        if self.last_tick.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            self.last_tick = Some(Instant::now());
+            self.refresh();
+        }
+        self.push_tray();
+        if self.hidden {
+            // Keep `logic` ticking (signals, label) while nothing is painted.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    /// Register the taskbar indicator; the panel works without one (e.g. no D-Bus session).
+    fn start_tray(&mut self, ctx: &egui::Context) {
+        use ksni::blocking::TrayMethods;
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let view = self.tray_view();
+        let ind = tray::Indicator::new(view.clone(), tx, std::sync::Arc::new(move || ctx.request_repaint()));
+        // Keep the item even if no tray host is running yet; it registers once one appears.
+        match ind.assume_sni_available(true).spawn() {
+            Ok(h) => {
+                self.tray = Some(h);
+                self.tray_rx = Some(rx);
+                self.tray_view = view;
+            }
+            Err(e) => eprintln!("benchit-panel: no taskbar indicator: {e}"),
+        }
+    }
+
+    fn tray_view(&self) -> tray::View {
+        let snap = self.feed.as_ref().map(|f| &f.snapshot);
+        let age = snap.map(|s| (timefmt::now_f64() - s.ts as f64).max(0.0)).unwrap_or(0.0);
+        tray::View {
+            label: tray::label(snap, age, self.unit),
+            tip: tray::tip(snap, age, self.unit),
+            hidden: self.hidden,
+            compact: self.compact,
+            busy: self.job.is_some(),
+        }
+    }
+
+    fn push_tray(&mut self) {
+        let Some(h) = &self.tray else { return };
+        let v = self.tray_view();
+        if v != self.tray_view {
+            self.tray_view = v.clone();
+            if h.update(|t| t.view = v).is_none() {
+                eprintln!("benchit-panel: taskbar indicator stopped");
+                self.tray = None;
+            }
         }
     }
 
@@ -372,6 +468,10 @@ impl eframe::App for Panel {
         [0.0, 0.0, 0.0, 0.0]
     }
 
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
@@ -390,16 +490,9 @@ impl eframe::App for Panel {
             )
         });
 
-        self.apply_show(ctx);
-        self.poll_job();
-
-        if self.last_tick.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
-            self.last_tick = Some(Instant::now());
-            self.refresh();
-            if self.work_checked.elapsed() > Duration::from_secs(15) {
-                self.work = x11_work_area().or(self.work);
-                self.work_checked = Instant::now();
-            }
+        if self.work_checked.elapsed() > Duration::from_secs(15) {
+            self.work = x11_work_area().or(self.work);
+            self.work_checked = Instant::now();
         }
 
         // GNOME/XWayland drops pre-map always-on-top; (re)apply after the window exists
@@ -590,7 +683,10 @@ fn prefer_x11_software() {
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.show {
-        return signal_show();
+        return signal_panel(libc::SIGUSR1);
+    }
+    if args.hide {
+        return signal_panel(libc::SIGUSR2);
     }
     let dir = args.dir.clone().unwrap_or_else(paths::default_dir);
     if let Some(format) = args.export {
@@ -643,6 +739,9 @@ fn main() -> Result<()> {
         hidden: false,
         reports_dir: report::reports_dir(),
         unit: benchit_telemetry_core::PanelPrefs::load().temp_unit,
+        tray: None,
+        tray_rx: None,
+        tray_view: Default::default(),
     };
     if args.menu && panel.snapshot.is_some() {
         panel.menu = Some((Pos2::new(40.0, 60.0), None));
@@ -650,11 +749,13 @@ fn main() -> Result<()> {
     if panel.snapshot.is_none() {
         // SAFETY: the handler only stores to an atomic.
         unsafe {
-            libc::signal(libc::SIGUSR1, on_sigusr1 as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGUSR1, on_signal as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGUSR2, on_signal as *const () as libc::sighandler_t);
         }
         let _ = std::fs::write(pid_file(), format!("{}\n", std::process::id()));
     }
     panel.refresh();
+    let want_tray = panel.snapshot.is_none() && !args.no_tray;
     let max_h = work.map(|r| r.height() - 2.0 * MARGIN).unwrap_or(1000.0);
     let mut h = panel.fit_height(max_h);
     if panel.menu.is_some() {
@@ -687,6 +788,10 @@ fn main() -> Result<()> {
         Box::new(|cc| {
             gui::install_fonts(&cc.egui_ctx);
             menu::style(&cc.egui_ctx);
+            let mut panel = panel;
+            if want_tray {
+                panel.start_tray(&cc.egui_ctx);
+            }
             Ok(Box::new(panel))
         }),
     )
@@ -727,6 +832,9 @@ mod tests {
             hidden: false,
             reports_dir: reports.to_path_buf(),
             unit: Default::default(),
+            tray: None,
+            tray_rx: None,
+            tray_view: Default::default(),
         }
     }
 
@@ -780,19 +888,52 @@ mod tests {
         assert!(Config::load_from(&d.path().join("panel.json")).compact);
     }
 
+    /// Hide is never a dead end: the logic tick (which eframe keeps running for a hidden
+    /// window) brings the panel back on SIGUSR1 and keeps itself scheduled meanwhile.
     #[test]
-    fn hide_then_show_signal() {
+    fn hide_then_show_via_signals() {
         let d = tempfile::tempdir().unwrap();
         let mut p = panel(d.path(), d.path());
         let ctx = egui::Context::default();
         let out = pass(&ctx, |ctx| p.act(ctx, menu::Action::Hide));
         assert!(p.hidden);
         assert!(viewport_cmds(&out).contains(&ViewportCommand::Visible(false)));
+        pass(&ctx, |ctx| p.tick(ctx));
+        assert!(ctx.has_requested_repaint(), "a hidden panel must keep ticking");
         // SIGUSR1, as sent by `benchit-panel --show`
-        on_sigusr1(libc::SIGUSR1);
-        let out = pass(&ctx, |ctx| p.apply_show(ctx));
+        on_signal(libc::SIGUSR1);
+        let out = pass(&ctx, |ctx| p.tick(ctx));
         assert!(!p.hidden);
         assert!(viewport_cmds(&out).contains(&ViewportCommand::Visible(true)));
+        // SIGUSR2 (`--hide`) and back again
+        on_signal(libc::SIGUSR2);
+        pass(&ctx, |ctx| p.tick(ctx));
+        assert!(p.hidden);
+        on_signal(libc::SIGUSR1);
+        pass(&ctx, |ctx| p.tick(ctx));
+        assert!(!p.hidden);
+    }
+
+    #[test]
+    fn taskbar_click_toggles_and_menu_actions_run() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = panel(d.path(), d.path());
+        let (tx, rx) = mpsc::channel();
+        p.tray_rx = Some(rx);
+        let ctx = egui::Context::default();
+        tx.send(tray::Cmd::ToggleWindow).unwrap();
+        let out = pass(&ctx, |ctx| p.tick(ctx));
+        assert!(p.hidden && viewport_cmds(&out).contains(&ViewportCommand::Visible(false)));
+        tx.send(tray::Cmd::ToggleWindow).unwrap();
+        let out = pass(&ctx, |ctx| p.tick(ctx));
+        assert!(!p.hidden && viewport_cmds(&out).contains(&ViewportCommand::Visible(true)));
+        tx.send(tray::Cmd::Do(menu::Action::ToggleCompact)).unwrap();
+        tx.send(tray::Cmd::Do(menu::Action::CopyStats)).unwrap();
+        let out = pass(&ctx, |ctx| p.tick(ctx));
+        assert!(p.compact);
+        assert!(out.platform.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(_))));
+        let v = p.tray_view();
+        assert!(v.compact && !v.hidden && v.label.starts_with("CPU "), "{v:?}");
     }
 
     #[test]
