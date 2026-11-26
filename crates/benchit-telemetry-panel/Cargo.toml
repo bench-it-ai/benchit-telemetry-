@@ -25,3 +25,7 @@ libc.workspace = true
 eframe.workspace = true
 x11rb.workspace = true
 png.workspace = true
+printpdf.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

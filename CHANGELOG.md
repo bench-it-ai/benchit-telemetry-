@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Panel right-click menu: Compact (as before), Hide panel (`benchit-panel --show` restores it),
+  Copy stats to the clipboard, Export CSV / JSON and PDF report over 1h/24h/7d/30d, Quit.
+  Exports hold the live snapshot plus the stored history, are written in the background to
+  `~/benchit-reports/` (`$BENCHIT_REPORTS_DIR`), and their path is shown in the panel and as a
+  desktop notification. The PDF is generated in pure Rust (`printpdf`, built-in fonts).
+- `benchit-panel --export csv|json|pdf [--range 24h] [--out-dir DIR]` writes the same files
+  headless; `--snapshot ... --menu` renders the menu.
+- core: `Store::open_in_memory`, `Collector::has_pkg_power`.
+- The daemon's unreadable-RAPL warning is only logged when no package counter is readable (an
+  unreadable `intel-rapl-mmio:0` next to a readable `intel-rapl:0` no longer triggers it).
 - The daemon logs which RAPL `energy_uj` counters it cannot read at startup, so an empty
   `pkg_w` (`n/a` in the panel) explains itself; new `collect::unreadable_rapl_zones`.
 - README: new "CPU package power" section with a udev rule (survives module reloads), notes that

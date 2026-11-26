@@ -89,7 +89,7 @@ A daemon holds an `flock` on `daemon.lock` there, so two daemons cannot share a 
 | `latest.json` | every tick | flat panel feed for desktop widgets (also `--panel-json PATH`) |
 | `fast-until.d/<pid>` | by `run` | 30-second leases refreshed while a `run` is alive; while any live one is unexpired, every tick is stored (the old single `fast-until` file is still honoured) |
 | `daemon.lock` | daemon | `flock` that stops a second daemon |
-| `exports/` | `export` and the panel export action | CSV or JSON dumps of `samples_wide` for a chosen window |
+| `exports/` | `export` | CSV or JSON dumps of `samples_wide` for a chosen window (the panel menu writes to `~/benchit-reports/` instead) |
 
 Storage rows are **interval averages**: CPU %, package/platform watts, fault rates and disk and
 network throughput are averaged over the whole `--interval`, and GPU power and utilisation over
@@ -233,9 +233,29 @@ WHERE m.name = 'llama-bench' GROUP BY g.idx;
 * **Native panel** (`benchit-panel`, crate `benchit-telemetry-panel`, egui): an always-on-top,
   display-only window fed by the daemon's `current.json` (read through `benchit-telemetry-core`),
   with sparklines seeded from `metrics.db`. It sizes itself to its content, stays inside the
-  monitor work area, and shows every GPU, storage/network and the recording status. Right-click
-  toggles compact mode (remembered in `~/.config/benchit-panel.json`), left-drag moves it,
-  middle-click quits. `benchit-panel --snapshot out.png [--compact]` renders one frame to a PNG.
+  monitor work area, and shows every GPU, storage/network and the recording status. Left-drag
+  moves it, middle-click quits, and right-click opens a menu:
+  * **Compact** toggles compact mode (remembered in `~/.config/benchit-panel.json`);
+  * **Hide panel** hides the window (the process keeps running); `benchit-panel --show` brings
+    it back (it signals the pid in `$XDG_RUNTIME_DIR/benchit-panel.pid`), as does restarting
+    `benchit-panel.service`;
+  * **Copy stats** puts the `benchit-telemetry panel` text view plus a timestamp on the clipboard;
+  * **Export CSV / Export JSON / PDF report** for the last 1h, 24h, 7d or 30d, written in the
+    background to `~/benchit-reports/` (`$BENCHIT_REPORTS_DIR` overrides) as
+    `benchit-<host>-<range>-<UTC timestamp>.<ext>` (mode 0600, never overwritten). The saved path
+    is shown at the bottom of the panel, logged, and sent as a desktop notification when
+    `notify-send` exists. Every export holds the live snapshot and the stored history of the
+    window: CSV has the `samples_wide` rows at full resolution with the live snapshot as the
+    last row; JSON has `current`, `summary` (min/avg/p95/max, energy estimate), `history` and
+    `gpu_history` (averaged into `history_step_s` buckets when the window would exceed 10 000
+    rows); the PDF report (A4, built-in fonts, generated in Rust by `printpdf`) has the current
+    snapshot, the summary tables per metric and GPU, and charts of power, temperature,
+    utilisation and memory;
+  * **Quit panel** closes the panel (the logger keeps running).
+
+  The same files can be written without a window: `benchit-panel --export csv|json|pdf
+  [--range 24h] [--out-dir DIR]` prints the path. `benchit-panel --snapshot out.png [--compact]
+  [--menu]` renders one frame (optionally with the menu open) to a PNG.
   It stays above other windows and on every workspace (EWMH always-on-top and sticky, applied after mapping — GNOME ignores the pre-map hint). It runs on X11 (XWayland under GNOME, because Wayland clients cannot position windows) and
   uses Mesa software GL so it never touches a benchmark GPU (`BENCHIT_PANEL_GPU=1` to opt out).
   Needs only runtime libraries that desktops already have (libX11, libGL/libEGL, libxkbcommon);

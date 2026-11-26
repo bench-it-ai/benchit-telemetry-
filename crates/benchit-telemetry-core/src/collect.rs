@@ -152,6 +152,11 @@ impl Collector {
         &self.host
     }
 
+    /// Whether a readable RAPL package counter was found (so `pkg_w` can be reported).
+    pub fn has_pkg_power(&self) -> bool {
+        self.pkg.is_some()
+    }
+
     fn p(&self, rel: &str) -> PathBuf {
         self.cfg.root.join(rel)
     }
@@ -778,12 +783,14 @@ mod tests {
         w(r, "sys/class/powercap/intel-rapl:0/energy_uj", "5000000\n");
         w(r, "sys/class/powercap/intel-rapl:0:0/energy_uj", "1\n");
         assert!(unreadable_rapl_zones(r).is_empty(), "readable counter");
+        assert!(quiet(r).has_pkg_power());
         let e = r.join("sys/class/powercap/intel-rapl:0/energy_uj");
         fs::set_permissions(&e, fs::Permissions::from_mode(0o000)).unwrap();
         if fs::read_to_string(&e).is_ok() {
             return; // running as root: permissions are not enforced
         }
         assert_eq!(unreadable_rapl_zones(r), vec![e.clone()]);
+        assert!(!quiet(r).has_pkg_power());
         assert_eq!(quiet(r).sample().cpu.pkg_w, None);
         fs::set_permissions(&e, fs::Permissions::from_mode(0o644)).unwrap();
     }

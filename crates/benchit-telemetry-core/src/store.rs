@@ -321,6 +321,14 @@ impl Store {
         Ok(Self { conn, path })
     }
 
+    /// A private in-memory database with the current schema. Used to turn a live [`Snapshot`]
+    /// into a row with exactly the columns of an on-disk export (see `benchit-panel` exports).
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        init_schema(&conn)?;
+        Ok(Self { conn, path: PathBuf::from(":memory:") })
+    }
+
     /// Open read-only (for API/CLI queries while the daemon writes).
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();

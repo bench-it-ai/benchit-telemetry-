@@ -120,8 +120,10 @@ fn collect_loop(
         rows = s.count()?;
     }
     let mut collector = Collector::new(cfg.collector.clone());
+    // only when it costs us pkg_w: e.g. an unreadable `intel-rapl-mmio:0` next to a readable
+    // `intel-rapl:0` package zone is harmless
     let locked = collect::unreadable_rapl_zones(&cfg.collector.root);
-    if !locked.is_empty() {
+    if !locked.is_empty() && !collector.has_pkg_power() {
         let list: Vec<String> = locked.iter().map(|p| p.display().to_string()).collect();
         eprintln!(
             "benchit-telemetry: CPU package power (pkg_w) unavailable: {} not readable by this user \
