@@ -52,6 +52,75 @@ fn x11_work_area() -> Option<Rect> {
         .then(|| Rect::from_min_size(Pos2::new(v[0] as f32, v[1] as f32), Vec2::new(v[2] as f32, v[3] as f32)))
 }
 
+/// Ask the window manager to keep this process's windows above others and on every workspace.
+///
+/// `ViewportBuilder::with_always_on_top()` is not enough on GNOME/XWayland: mutter ignores the
+/// `_NET_WM_STATE_ABOVE` property when it is set before the window is mapped, so the panel
+/// stays in the normal stack (hidden behind maximized apps) and only on the workspace where it
+/// was created. The old GTK panel did this with `set_keep_above(True)` and `stick()`. A native
+/// Wayland egui window would not help: GNOME has no layer-shell, and Wayland clients cannot
+/// position themselves. Returns whether at least one of our windows now has `_NET_WM_STATE_ABOVE`.
+fn x11_apply_panel_hints() -> bool {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{
+        AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask, StackMode, CLIENT_MESSAGE_EVENT,
+    };
+    let Ok((conn, screen)) = x11rb::connect(None) else { return false };
+    let root = conn.setup().roots[screen].root;
+    let intern = |n: &[u8]| conn.intern_atom(false, n).ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+    let (Some(net_client), Some(net_pid), Some(net_state), Some(net_desk), Some(above), Some(sticky)) = (
+        intern(b"_NET_CLIENT_LIST"),
+        intern(b"_NET_WM_PID"),
+        intern(b"_NET_WM_STATE"),
+        intern(b"_NET_WM_DESKTOP"),
+        intern(b"_NET_WM_STATE_ABOVE"),
+        intern(b"_NET_WM_STATE_STICKY"),
+    ) else {
+        return false;
+    };
+    let Ok(prop) = conn.get_property(false, root, net_client, AtomEnum::WINDOW, 0, 256) else { return false };
+    let Ok(prop) = prop.reply() else { return false };
+    let Some(wins) = prop.value32() else { return false };
+    let me = std::process::id();
+    let mut ok = false;
+    for w in wins {
+        let pid = conn
+            .get_property(false, w, net_pid, AtomEnum::CARDINAL, 0, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|p| p.value32().and_then(|mut v| v.next()));
+        if pid != Some(me) {
+            continue;
+        }
+        // EWMH requires a ClientMessage to the root (setting the property ourselves is ignored).
+        let send = |ty, data: [u32; 5]| {
+            let ev = ClientMessageEvent {
+                response_type: CLIENT_MESSAGE_EVENT,
+                format: 32,
+                sequence: 0,
+                window: w,
+                type_: ty,
+                data: data.into(),
+            };
+            let mask = EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT;
+            conn.send_event(false, root, mask, ev).ok()
+        };
+        // 1 = _NET_WM_STATE_ADD; source indication 1 = application
+        let _ = send(net_state, [1, above, sticky, 1, 0]);
+        let _ = send(net_desk, [0xFFFF_FFFF, 1, 0, 0, 0]);
+        let _ = conn.configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        let _ = conn.flush();
+        let has_above = conn
+            .get_property(false, w, net_state, AtomEnum::ATOM, 0, 16)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|p| p.value32().map(|v| v.collect::<Vec<_>>()))
+            .is_some_and(|v| v.contains(&above));
+        ok |= has_above;
+    }
+    ok
+}
+
 struct Panel {
     dir: PathBuf,
     cfg: Config,
@@ -72,6 +141,8 @@ struct Panel {
     shot: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<egui::ColorImage>>>>,
     frames: u32,
     debug: bool,
+    /// Last time we (re)applied always-on-top / sticky hints.
+    hints_at: Option<Instant>,
 }
 
 impl Panel {
@@ -162,6 +233,17 @@ impl eframe::App for Panel {
                 self.work = x11_work_area().or(self.work);
                 self.work_checked = Instant::now();
             }
+        }
+
+        // GNOME/XWayland drops pre-map always-on-top; (re)apply after the window exists
+        // and every 15 s in case mutter later forgets the state.
+        if self.snapshot.is_none()
+            && self.hints_at.is_none_or(|t| {
+                t.elapsed() > Duration::from_secs(15) || (self.frames < 30 && t.elapsed() > Duration::from_millis(200))
+            })
+            && (x11_apply_panel_hints() || self.frames > 8)
+        {
+            self.hints_at = Some(Instant::now());
         }
 
         if secondary {
@@ -334,6 +416,7 @@ fn main() -> Result<()> {
         shot: Default::default(),
         frames: 0,
         debug: args.debug_geometry,
+        hints_at: None,
     };
     panel.refresh();
     let max_h = work.map(|r| r.height() - 2.0 * MARGIN).unwrap_or(1000.0);

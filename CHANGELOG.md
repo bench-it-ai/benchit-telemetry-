@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-dev, panel visibility
+- The panel now sends `_NET_WM_STATE_ABOVE` and `_NET_WM_STATE_STICKY` as EWMH ClientMessages
+  after it is mapped. `with_always_on_top()` alone is ignored by GNOME/XWayland, so the window
+  was on screen but hidden behind maximized apps (and only on the workspace where it started).
+
 ## 0.1.0-dev, after the independent review
 Fixes for every blocker and major finding (and most minors) of the review of the first commit:
 - `run` survives SIGINT/SIGTERM/SIGHUP (forwarded to the command), always closes its mark and

@@ -215,7 +215,7 @@ WHERE m.name = 'llama-bench' GROUP BY g.idx;
   monitor work area, and shows every GPU, storage/network and the recording status. Right-click
   toggles compact mode (remembered in `~/.config/benchit-panel.json`), left-drag moves it,
   middle-click quits. `benchit-panel --snapshot out.png [--compact]` renders one frame to a PNG.
-  It runs on X11 (XWayland under GNOME, because Wayland clients cannot position windows) and
+  It stays above other windows and on every workspace (EWMH always-on-top and sticky, applied after mapping — GNOME ignores the pre-map hint). It runs on X11 (XWayland under GNOME, because Wayland clients cannot position windows) and
   uses Mesa software GL so it never touches a benchmark GPU (`BENCHIT_PANEL_GPU=1` to opt out).
   Needs only runtime libraries that desktops already have (libX11, libGL/libEGL, libxkbcommon);
   fonts Inter and JetBrains Mono are used if installed. Unit: `contrib/systemd/benchit-panel.service`.
