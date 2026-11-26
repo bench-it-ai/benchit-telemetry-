@@ -1,0 +1,18 @@
+# systemd --user unit for the benchit-telemetry logger.
+#   install -Dm644 benchit-telemetry.service ~/.config/systemd/user/benchit-telemetry.service
+#   systemctl --user daemon-reload && systemctl --user enable --now benchit-telemetry
+#   loginctl enable-linger "$USER"   # optional: keep logging when nobody is logged in
+[Unit]
+Description=benchit-telemetry logger (30-day history, panel feed, HTTP API)
+After=default.target
+
+[Service]
+# Data directory (metrics.db, latest.json, current.json). Remove to use ~/.local/state/benchit-telemetry.
+Environment=BENCHIT_TELEMETRY_DIR=%h/.local/state/benchit-telemetry
+ExecStart=%h/.local/bin/benchit-telemetry daemon --tick 2 --interval 10 --retain-days 30 --listen 127.0.0.1:9184
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=default.target

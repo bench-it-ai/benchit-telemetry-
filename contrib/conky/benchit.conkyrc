@@ -1,0 +1,11 @@
+-- conky panel driven by `benchit-telemetry panel` (lines never exceed --width, so nothing is cut off).
+conky.config = {
+    alignment = 'top_right', gap_x = 24, gap_y = 48,
+    own_window = true, own_window_type = 'desktop', own_window_transparent = false,
+    own_window_argb_visual = true, own_window_argb_value = 200, own_window_colour = '05060a',
+    use_xft = true, font = 'JetBrains Mono:size=9', default_color = 'e8eaec',
+    update_interval = 2, double_buffer = true, minimum_width = 340, maximum_width = 360,
+};
+conky.text = [[
+${execi 2 benchit-telemetry panel --format text --width 44}
+]];

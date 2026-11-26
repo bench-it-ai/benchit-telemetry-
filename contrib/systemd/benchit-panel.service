@@ -1,0 +1,16 @@
+# Optional GTK desktop panel (display only; needs python3-gobject + GTK 3).
+#   install -Dm755 ../gtk-panel/benchit-panel.py ~/.local/share/benchit-telemetry/benchit-panel.py
+[Unit]
+Description=benchit-telemetry desktop panel
+PartOf=graphical-session.target
+After=graphical-session.target benchit-telemetry.service
+
+[Service]
+Environment=GDK_BACKEND=x11
+Environment=BENCHIT_TELEMETRY_DIR=%h/.local/state/benchit-telemetry
+ExecStart=/usr/bin/python3 %h/.local/share/benchit-telemetry/benchit-panel.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

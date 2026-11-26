@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/benchit-telemetry-core", "crates/benchit-telemetry"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/benchit/benchit-telemetry"
+homepage = "https://github.com/benchit/benchit-telemetry"
+authors = ["BenchIt contributors"]
+keywords = ["telemetry", "benchmark", "gpu", "monitoring", "nvidia"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.43", features = ["bundled"] }
+libc = "0.2"
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
