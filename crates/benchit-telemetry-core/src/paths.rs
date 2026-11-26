@@ -50,6 +50,8 @@ pub const FAST_FILE: &str = "fast-until";
 pub const FAST_LEASE_DIR: &str = "fast-until.d";
 /// Held with `flock` by the running daemon so two cannot share a directory.
 pub const LOCK_FILE: &str = "daemon.lock";
+/// Directory under the data dir for panel/CLI history exports.
+pub const EXPORTS_DIR: &str = "exports";
 
 #[cfg(test)]
 mod tests {

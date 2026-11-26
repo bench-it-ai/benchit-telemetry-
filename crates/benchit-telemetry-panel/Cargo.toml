@@ -16,7 +16,7 @@ name = "benchit-panel"
 path = "src/main.rs"
 
 [dependencies]
-benchit-telemetry-core = { path = "../benchit-telemetry-core", version = "0.1.0-dev" }
+benchit-telemetry-core = { path = "../benchit-telemetry-core", version = "0.0.1" }
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

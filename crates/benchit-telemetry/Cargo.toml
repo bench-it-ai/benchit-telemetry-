@@ -16,7 +16,7 @@ name = "benchit-telemetry"
 path = "src/main.rs"
 
 [dependencies]
-benchit-telemetry-core = { path = "../benchit-telemetry-core", version = "0.1.0-dev" }
+benchit-telemetry-core = { path = "../benchit-telemetry-core", version = "0.0.1" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

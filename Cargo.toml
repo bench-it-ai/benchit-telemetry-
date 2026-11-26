@@ -3,11 +3,11 @@ resolver = "2"
 members = ["crates/benchit-telemetry-core", "crates/benchit-telemetry", "crates/benchit-telemetry-panel"]
 
 [workspace.package]
-version = "0.1.0-dev"
+version = "0.0.1"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/benchit/benchit-telemetry"
+repository = "https://github.com/bench-it-ai/benchit-telemetry-"
 authors = ["BenchIt contributors"]
 keywords = ["telemetry", "benchmark", "gpu", "monitoring", "nvidia"]
 categories = ["command-line-utilities", "development-tools::profiling"]
@@ -27,6 +27,7 @@ http-body-util = "0.1"
 eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "default_fonts"] }
 x11rb = "0.14"
 png = "0.18"
+toml = { version = "1", features = ["display", "parse"] }
 
 [profile.release]
 lto = "thin"

@@ -1,11 +1,28 @@
 # Changelog
 
-## 0.1.0-dev, panel visibility
+## 0.0.1 (2026-11-26)
+
+First public release.
+
+- Logger daemon with a rolling 30-day SQLite history, a local HTTP JSON API, a CLI for
+  summaries, exports and benchmark windows (`run`, marks), and panel feeds for conky and the
+  native desktop panel.
+- Native `benchit-panel` (egui, X11/XWayland) that stays above other windows and on every
+  workspace (EWMH `_NET_WM_STATE_ABOVE` and `STICKY` applied after map).
+- GPU metrics through NVML, with `nvidia-smi` as the fallback.
+- History export as CSV or JSON (`Store::export_csv`, `Store::export_json`, `export_to_dir`
+  writing under `<data-dir>/exports/`).
+- Shared panel preferences (`~/.config/benchit-telemetry/panel.toml`, migrated from
+  `~/.config/benchit-panel.json`); `benchit-telemetry panel` text output follows the configured
+  temperature unit (°C or °F).
+- Fixes from the independent pre-release review are listed below.
+
+## Pre-release: panel visibility
 - The panel now sends `_NET_WM_STATE_ABOVE` and `_NET_WM_STATE_STICKY` as EWMH ClientMessages
   after it is mapped. `with_always_on_top()` alone is ignored by GNOME/XWayland, so the window
   was on screen but hidden behind maximized apps (and only on the workspace where it started).
 
-## 0.1.0-dev, after the independent review
+## Pre-release: after the independent review
 Fixes for every blocker and major finding (and most minors) of the review of the first commit:
 - `run` survives SIGINT/SIGTERM/SIGHUP (forwarded to the command), always closes its mark and
   removes its lease, uses short per-process leases (`fast-until.d/<pid>`, 30 s) instead of a
@@ -21,7 +38,7 @@ Fixes for every blocker and major finding (and most minors) of the review of the
   timeout, runtime-suspended hybrid-laptop dGPUs are never woken.
 - Time parsing: bare small numbers and non-finite values are rejected (no more Julian days);
   `Z`/offset timestamps tested. Schema version in `user_version`, migration and refusal of newer
-  databases. Version is `0.1.0-dev` everywhere; one documented data directory with automatic
+  databases. Version was `0.1.0-dev` during this work; one documented data directory with automatic
   support for the old `~/telemetry`; a dead collector thread stops the daemon and turns `/health`
   to 503; redundant `homepage` manifest keys removed.
 - Also: monotonic scheduling (clock steps), tick validation, 0700/0600 files, daemon `flock`,
@@ -32,7 +49,7 @@ Fixes for every blocker and major finding (and most minors) of the review of the
   lookup, flag names `WARN_MEM_LOW`/`WARN_BATTERY_LOW`, conflicting CLI window flags, CI hardening
   (pinned actions, `cargo doc`, `cargo deny`, MSRV tests), SECURITY.md/CONTRIBUTING.md.
 
-## 0.1.0-dev (unreleased, pre-review)
+## Pre-release: before the review
 - Collector: CPU util/clock/temps (k10temp, coretemp, vendor WMI), RAPL package/psys power,
   memory/swap/page-fault rates, disk and network throughput, filesystem usage, fans, battery,
   top process, NVIDIA GPUs via `nvidia-smi`.

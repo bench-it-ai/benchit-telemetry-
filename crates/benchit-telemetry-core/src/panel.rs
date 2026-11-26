@@ -130,7 +130,13 @@ fn fit(line: String, width: usize) -> String {
 }
 
 /// Fixed-width multi-line text; every line is at most `width` characters (never cut off).
+/// Temperatures are in Celsius.
 pub fn text(s: &Snapshot, width: usize) -> String {
+    text_with_unit(s, width, crate::prefs::TempUnit::C)
+}
+
+/// Like [`text`], with temperatures in `unit`.
+pub fn text_with_unit(s: &Snapshot, width: usize, unit: crate::prefs::TempUnit) -> String {
     let width = width.max(24);
     let mut lines = Vec::new();
     let up = s.uptime_s.unwrap_or(0.0) as u64;
@@ -140,8 +146,9 @@ pub fn text(s: &Snapshot, width: usize) -> String {
     lines.push(status);
     lines.push(format!("CPU  {}", short_name(s.cpu.model.as_deref().unwrap_or("cpu"))));
     lines.push(format!(
-        "  {}°C  {}%  {} MHz  {} W",
-        f(s.cpu.temp_c, 0),
+        "  {}{}  {}%  {} MHz  {} W",
+        unit.format(s.cpu.temp_c, 0),
+        unit.label(),
         f(s.cpu.util_pct, 0),
         f(s.cpu.mhz, 0),
         f(s.cpu.pkg_w, 0)
@@ -150,8 +157,9 @@ pub fn text(s: &Snapshot, width: usize) -> String {
         lines.push(format!("GPU{} {}", g.idx, short_name(&g.name)));
         let lim = g.power_limit_w.map(|l| format!("/{l:.0}")).unwrap_or_default();
         lines.push(format!(
-            "  {}°C  {}%  {}{} W  {:.1}/{:.0} GB",
-            f(g.temp_c, 0),
+            "  {}{}  {}%  {}{} W  {:.1}/{:.0} GB",
+            unit.format(g.temp_c, 0),
+            unit.label(),
             f(g.util_pct, 0),
             f(g.power_w, 0),
             lim,
@@ -232,6 +240,15 @@ mod tests {
         let t = text(&sample(), 30);
         assert!(t.lines().all(|l| l.chars().count() <= 30), "{t}");
         assert!(t.contains("GPU0 RTX 5060 Ti"));
+        assert!(t.contains("40°C"), "{t}");
+    }
+
+    #[test]
+    fn text_respects_fahrenheit() {
+        let t = text_with_unit(&sample(), 40, crate::prefs::TempUnit::F);
+        assert!(t.contains("104°F"), "{t}");
+        assert!(!t.contains("°C"), "{t}");
+        assert!(t.lines().all(|l| l.chars().count() <= 40), "{t}");
     }
 
     #[test]

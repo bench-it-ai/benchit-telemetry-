@@ -120,7 +120,7 @@ async fn foreign_host_headers_are_refused() {
         "localhost.attacker.example:9184",
         "127.0.0.1.attacker.example",
         "0.0.0.0:9184",
-        "192.168.1.5:9184",
+        "203.0.113.5:9184",
     ] {
         for uri in ["/metrics/current", "/api/v1/history", "/health", "/marks"] {
             let (c, _) = call(app.clone(), with_host(uri, host)).await;

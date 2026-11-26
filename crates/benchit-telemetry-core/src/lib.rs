@@ -18,9 +18,11 @@ pub mod model;
 pub mod panel;
 pub mod parse;
 pub mod paths;
+pub mod prefs;
 pub mod store;
 pub mod timefmt;
 
 pub use collect::{Collector, CollectorConfig};
 pub use model::Snapshot;
+pub use prefs::{ExportKind, ExportRange, PanelPrefs, TempUnit};
 pub use store::Store;

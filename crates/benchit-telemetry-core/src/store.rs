@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Current schema version, stored in `PRAGMA user_version`.
@@ -774,6 +775,57 @@ impl Store {
         }
         Ok(n)
     }
+
+    /// Write `samples_wide` rows in `from..=to` as a pretty JSON array of objects.
+    pub fn export_json(&self, from: i64, to: i64, out: &mut dyn std::io::Write) -> Result<usize> {
+        let mut st = self.conn.prepare("SELECT * FROM samples_wide WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts")?;
+        let cols: Vec<String> = st.column_names().map(|s| s.to_string()).collect();
+        let mut rows = st.query(params![from, to])?;
+        let mut arr = Vec::new();
+        while let Some(r) = rows.next()? {
+            let mut obj = Map::new();
+            for (i, name) in cols.iter().enumerate() {
+                let v = match r.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => Value::Null,
+                    rusqlite::types::ValueRef::Integer(x) => Value::from(x),
+                    rusqlite::types::ValueRef::Real(x) => Value::from(x),
+                    rusqlite::types::ValueRef::Text(t) => Value::from(String::from_utf8_lossy(t).into_owned()),
+                    rusqlite::types::ValueRef::Blob(_) => Value::Null,
+                };
+                obj.insert(name.clone(), v);
+            }
+            arr.push(Value::Object(obj));
+        }
+        let n = arr.len();
+        serde_json::to_writer_pretty(&mut *out, &arr)?;
+        writeln!(out)?;
+        Ok(n)
+    }
+}
+
+/// Write a CSV or JSON export of `from..=to` under `<data_dir>/exports/`.
+///
+/// The file is named `telemetry-<tag>-<UTC timestamp>.{csv,json}` and created with mode 0600.
+pub fn export_to_dir(
+    store: &Store,
+    data_dir: &Path,
+    from: i64,
+    to: i64,
+    tag: &str,
+    kind: crate::prefs::ExportKind,
+    now: i64,
+) -> Result<PathBuf> {
+    let dir = data_dir.join(crate::paths::EXPORTS_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("telemetry-{tag}-{}.{}", crate::timefmt::compact_utc(now), kind.ext()));
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
+    restrict_file(&path);
+    match kind {
+        crate::prefs::ExportKind::Csv => store.export_csv(from, to, &mut f)?,
+        crate::prefs::ExportKind::Json => store.export_json(from, to, &mut f)?,
+    };
+    f.flush().ok();
+    Ok(path)
 }
 
 /// Quote a text cell for CSV, and neutralise spreadsheet formula injection (`=`, `+`, `-`, `@`,
@@ -1170,5 +1222,31 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert!(text.starts_with("local_time,ts,host,"));
         assert!(text.contains("\"[{\"\"name\"\":\"\"cpu\"\",\"\"rpm\"\":900}]\""));
+    }
+    #[test]
+    fn json_export_and_export_to_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = Store::open(d.path().join("m.db")).unwrap();
+        s.insert(&snap(1_000_000, 5.0)).unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(s.export_json(0, 2_000_000, &mut buf).unwrap(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let arr = v.as_array().expect("json array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["ts"], 1_000_000);
+        assert_eq!(arr[0]["host"], "test");
+
+        let path = export_to_dir(&s, d.path(), 0, 2_000_000, "1h", crate::prefs::ExportKind::Csv, 0).unwrap();
+        assert_eq!(path.file_name().unwrap(), "telemetry-1h-19700101T000000Z.csv");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("local_time,ts,host,"));
+        let mode = std::fs::metadata(&path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(mode.mode() & 0o777, 0o600);
+
+        let path = export_to_dir(&s, d.path(), 0, 2_000_000, "24h", crate::prefs::ExportKind::Json, 0).unwrap();
+        assert_eq!(path.extension().unwrap(), "json");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
     }
 }

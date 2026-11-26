@@ -4,8 +4,8 @@ Workstation telemetry for benchmarking on Linux GPU boxes: a logger daemon that 
 rolling **30-day SQLite history**, an **HTTP JSON API**, a **CLI** for summaries, exports and
 benchmark windows, and **panel feeds** for desktop widgets (conky, the native desktop panel).
 
-> Status: **0.1.0-dev.** An independent review (blockers and majors fixed, see `CHANGELOG.md`) has
-> been done; APIs and the CLI may still change before 0.1.0.
+> Status: **0.0.1** (first public release). An independent review of the pre-release tree is
+> reflected in `CHANGELOG.md`. APIs and the CLI may still change in 0.x.
 
 ## What it records
 
@@ -22,7 +22,7 @@ benchmark windows, and **panel feeds** for desktop widgets (conky, the native de
 ## Install
 
 ```sh
-cargo install --git https://github.com/benchit/benchit-telemetry benchit-telemetry
+cargo install --git https://github.com/bench-it-ai/benchit-telemetry- benchit-telemetry
 # or from a checkout
 cargo build --release && install -Dm755 target/release/benchit-telemetry ~/.local/bin/benchit-telemetry
 
@@ -70,6 +70,7 @@ A daemon holds an `flock` on `daemon.lock` there, so two daemons cannot share a 
 | `latest.json` | every tick | flat panel feed for desktop widgets (also `--panel-json PATH`) |
 | `fast-until.d/<pid>` | by `run` | 30-second leases refreshed while a `run` is alive; while any live one is unexpired, every tick is stored (the old single `fast-until` file is still honoured) |
 | `daemon.lock` | daemon | `flock` that stops a second daemon |
+| `exports/` | `export` and the panel export action | CSV or JSON dumps of `samples_wide` for a chosen window |
 
 Storage rows are **interval averages**: CPU %, package/platform watts, fault rates and disk and
 network throughput are averaged over the whole `--interval`, and GPU power and utilisation over
@@ -84,6 +85,7 @@ benchit-telemetry daemon [--tick 2] [--interval 10] [--retain-days 30] [--listen
 benchit-telemetry serve  [--listen 127.0.0.1:9184] [--read-only] [--allow-host NAME]...  # API + live data, no storing
 benchit-telemetry current [--pretty]                     # snapshot JSON
 benchit-telemetry panel  [--format text|json|flat] [--width 44]
+                         # text temperatures follow ~/.config/benchit-telemetry/panel.toml
 benchit-telemetry status
 benchit-telemetry summary [--since 30m | --from T --to T | --mark NAME] [--json]
 benchit-telemetry history [--since 1h] [--fields cpu_util_pct,gpu_total_w] [--step 60] [--json]

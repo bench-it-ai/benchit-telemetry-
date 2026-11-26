@@ -225,3 +225,25 @@ fn a_signal_during_the_pre_start_wait_still_closes_everything() {
     assert!(m[0].note.as_deref().unwrap().contains("before the command started"));
     assert_eq!(leases(d.path()), 0);
 }
+
+#[test]
+fn panel_text_uses_configured_temp_unit() {
+    let d = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let dir = cfg.path().join("benchit-telemetry");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("panel.toml"), "temp_unit = \"f\"\n").unwrap();
+    let ts = benchit_telemetry_core::timefmt::now();
+    let snap = benchit_telemetry_core::Snapshot {
+        ts,
+        host: "t".into(),
+        cpu: benchit_telemetry_core::model::Cpu { temp_c: Some(100.0), ..Default::default() },
+        ..Default::default()
+    };
+    std::fs::write(d.path().join("current.json"), serde_json::to_vec(&snap).unwrap()).unwrap();
+    let out = cmd(d.path()).args(["panel", "--format", "text"]).env("XDG_CONFIG_HOME", cfg.path()).output().unwrap();
+    assert!(out.status.success(), "stderr {}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("212°F"), "{text}");
+    assert!(!text.contains("°C"), "{text}");
+}

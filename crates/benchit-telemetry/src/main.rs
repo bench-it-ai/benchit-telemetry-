@@ -562,7 +562,10 @@ fn main() -> Result<()> {
         Cmd::Panel { format, width } => {
             let s = live_snapshot(&ctx);
             match format {
-                PanelFormat::Text => println!("{}", panel::text(&s, width)),
+                PanelFormat::Text => {
+                    let unit = benchit_telemetry_core::prefs::PanelPrefs::load().temp_unit;
+                    println!("{}", panel::text_with_unit(&s, width, unit));
+                }
                 PanelFormat::Json => println!("{}", serde_json::to_string(&s)?),
                 PanelFormat::Flat => println!("{}", panel::flat_json(&s, None)),
             }
