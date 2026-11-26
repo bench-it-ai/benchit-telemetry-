@@ -120,6 +120,15 @@ fn collect_loop(
         rows = s.count()?;
     }
     let mut collector = Collector::new(cfg.collector.clone());
+    let locked = collect::unreadable_rapl_zones(&cfg.collector.root);
+    if !locked.is_empty() {
+        let list: Vec<String> = locked.iter().map(|p| p.display().to_string()).collect();
+        eprintln!(
+            "benchit-telemetry: CPU package power (pkg_w) unavailable: {} not readable by this user \
+             (root-only since Linux 5.10); see README \"CPU package power\" for the udev rule",
+            list.join(", ")
+        );
+    }
     // Scheduling uses the monotonic clock: a wall-clock step (NTP at boot, manual change) must
     // never stop or burst storage. The wall clock is only used for the `ts` written to rows.
     let mut last_store: Option<Instant> = None;

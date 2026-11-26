@@ -489,6 +489,24 @@ fn hottest(dir: &Path) -> Option<f64> {
         .map(|v| round(v as f64 / 1000.0, 1))
 }
 
+/// Top-level RAPL powercap zones (`intel-rapl:N`, also used by AMD Zen through `intel_rapl_msr`)
+/// whose `energy_uj` exists but cannot be read by this process. Since Linux 5.10 (CVE-2020-8694)
+/// the counter is root-only (`0400`) unless an administrator relaxes it, which leaves
+/// `pkg_w`/`platform_w` empty. Returns an empty list when RAPL is readable or absent.
+pub fn unreadable_rapl_zones(root: &Path) -> Vec<PathBuf> {
+    let powercap = root.join("sys/class/powercap");
+    let dirs: Vec<PathBuf> =
+        fs::read_dir(&powercap).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    let mut out: Vec<PathBuf> = dirs
+        .into_iter()
+        .filter(|d| d.file_name().is_some_and(|f| f.to_string_lossy().matches(':').count() == 1))
+        .map(|d| d.join("energy_uj"))
+        .filter(|e| e.exists() && fs::read_to_string(e).is_err())
+        .collect();
+    out.sort();
+    out
+}
+
 fn discover_rapl(powercap: &Path) -> (Option<Energy>, Option<Energy>) {
     let (mut pkg, mut psys) = (None, None);
     let mut dirs: Vec<PathBuf> =
@@ -748,6 +766,26 @@ mod tests {
         let s1 = c.sample();
         let stored = c.interval_snapshot(&s1, 0.01); // span 60 ms > max_span 10 ms
         assert_eq!((stored.cpu.util_pct, stored.net.rx_mbs, stored.disk.read_mbs), (None, None, None));
+    }
+
+    #[test]
+    fn unreadable_rapl_zones_lists_root_only_counters() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        assert!(unreadable_rapl_zones(r).is_empty(), "no powercap at all");
+        w(r, "sys/class/powercap/intel-rapl:0/name", "package-0\n");
+        w(r, "sys/class/powercap/intel-rapl:0/energy_uj", "5000000\n");
+        w(r, "sys/class/powercap/intel-rapl:0:0/energy_uj", "1\n");
+        assert!(unreadable_rapl_zones(r).is_empty(), "readable counter");
+        let e = r.join("sys/class/powercap/intel-rapl:0/energy_uj");
+        fs::set_permissions(&e, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_to_string(&e).is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        assert_eq!(unreadable_rapl_zones(r), vec![e.clone()]);
+        assert_eq!(quiet(r).sample().cpu.pkg_w, None);
+        fs::set_permissions(&e, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]

@@ -12,7 +12,7 @@ benchmark windows, and **panel feeds** for desktop widgets (conky, the native de
 | Area | Source | Metrics |
 |---|---|---|
 | CPU | `/proc/stat`, cpufreq, `/proc/loadavg`, hwmon (`k10temp`, `coretemp`, vendor WMI) | utilisation, avg clock, load, Tctl/package temp, CCD or hottest-core temps |
-| CPU power | RAPL powercap (`package-0`, `psys`) | package and platform watts (needs a readable `energy_uj`, see below) |
+| CPU power | RAPL powercap (`package-0`, `psys`) | package and platform watts (needs a readable `energy_uj`, see [CPU package power](#cpu-package-power)) |
 | Memory | `/proc/meminfo`, `/proc/vmstat` | used %, available, swap used, major faults/s, swap in/out per s |
 | Disk | `/proc/diskstats`, `statvfs` | read/write MB/s and busy % of physical disks; `/` and `$HOME` usage |
 | Network | `/proc/net/dev` | RX/TX MB/s of physical NICs |
@@ -40,17 +40,36 @@ and CLI; the native panel needs 1.95.
 **Hybrid laptops:** a dGPU whose PCI `power/runtime_status` is `suspended` is never queried, so
 benchmarking power is not distorted by the logger waking it; it is reported with `pstate = "D3"`
 and no readings.
-No root is needed. RAPL energy counters are root-only on many distributions; to let the
-logger read CPU package power, an administrator can run (this exposes energy counters to all
-local users, which has known side-channel implications):
+
+### CPU package power
+
+No root is needed to run the logger, but RAPL energy counters (`energy_uj`) are root-only
+(`0400`) on Linux 5.10 and later (CVE-2020-8694), so `pkg_w`/`cpu_pkg_w` stay empty (`n/a` in the
+panel, "gpus only" totals) until an administrator relaxes them. The daemon logs which counters it
+could not read at startup (`journalctl --user -u benchit-telemetry`). This applies to AMD Zen too:
+`intel_rapl_msr` exposes the Ryzen/EPYC package counter as `intel-rapl:0` (`package-0`).
+
+Making the counters world-readable exposes them to all local users, which has known
+side-channel implications; only do this on machines you trust every user of. A udev rule
+survives reboots and module reloads (preferred):
 
 ```sh
-# one line per zone: package-0 is usually intel-rapl:0, psys intel-rapl:1; multi-socket machines
-# have intel-rapl:N for each socket (check /sys/class/powercap/*/name)
+sudo tee /etc/udev/rules.d/99-benchit-rapl.rules >/dev/null <<'RULE'
+SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/sh -c 'chmod a+r /sys%p/energy_uj 2>/dev/null || true'"
+RULE
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=powercap --action=change
+```
+
+Alternatively, a tmpfiles.d entry (one line per zone, check `/sys/class/powercap/*/name`):
+
+```sh
 echo 'z /sys/class/powercap/intel-rapl:0/energy_uj 0444 - - -
 z /sys/class/powercap/intel-rapl:1/energy_uj 0444 - - -' | sudo tee /etc/tmpfiles.d/benchit-rapl.conf
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/benchit-rapl.conf
 ```
+
+The logger re-checks RAPL every 10 minutes, so no restart is needed after either change.
 
 ## Files
 

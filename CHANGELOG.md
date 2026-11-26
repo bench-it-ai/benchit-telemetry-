@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- The daemon logs which RAPL `energy_uj` counters it cannot read at startup, so an empty
+  `pkg_w` (`n/a` in the panel) explains itself; new `collect::unreadable_rapl_zones`.
+- README: new "CPU package power" section with a udev rule (survives module reloads), notes that
+  AMD Zen exposes package power through `intel-rapl:0`.
+
 ## 0.0.1 (2026-11-26)
 
 First public release.
